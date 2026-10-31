@@ -6,6 +6,7 @@ import com.google.gson.GsonBuilder;
 import com.kicobicn.TPATools.config.ModConfigs;
 import com.kicobicn.TPATools.database.DatabaseManager;
 import com.kicobicn.TPATools.util.ModUtils;
+import com.kicobicn.TPATools.util.TeleportDelayManager;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import net.minecraft.ChatFormatting;
 import net.minecraft.commands.Commands;
@@ -15,7 +16,10 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -34,7 +38,11 @@ public class TPAHandler {
     private static final Map<UUID, Long> cooldowns = new HashMap<>();
     private static final Map<UUID, Boolean> toggleStates = new HashMap<>();
     private static final Map<UUID, Set<UUID>> lockedPlayers = new HashMap<>();
+    private static final Logger LOGGER = LogManager.getLogger("TPAtools");
     public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String PERMISSIONS_FILE = "tpatool.json";
+    private static final String TOGGLES_FILE = "tpatool_toggles.json";
+    private static final String LOCKS_FILE = "tpatool_locks.json";
 
     public static class TPARequest {
         public final ServerPlayer sender;
@@ -51,48 +59,48 @@ public class TPAHandler {
     }
 
     // 加载命令权限状态
+    // 加载命令权限状态
     public static void loadCommandPermissions() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM command_permissions");
+        ModConfigs.commandPermissions.clear();
+
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM command_permissions");
                  ResultSet rs = stmt.executeQuery()) {
-                
-                ModConfigs.commandPermissions.clear();
                 while (rs.next()) {
-                    String command = rs.getString("command");
-                    boolean needOp = rs.getBoolean("need_op");
-                    ModConfigs.commandPermissions.put(command, needOp);
+                    ModConfigs.commandPermissions.put(rs.getString("command"), rs.getBoolean("need_op"));
                 }
                 ModConfigs.DebugLog.info("Loaded command permissions from MySQL");
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load command permissions from MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to load command permissions from MySQL: {}", e.getMessage());
             }
         } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool.json");
-                if (Files.exists(path)) {
+            Path path = ModConfigs.getConfigDir().resolve(PERMISSIONS_FILE);
+            if (Files.exists(path)) {
+                try {
                     String jsonContent = Files.readString(path);
-                    Map<String, Boolean> loadedPermissions = GSON.fromJson(jsonContent, new TypeToken<Map<String, Boolean>>(){}.getType());
-                    ModConfigs.commandPermissions.clear();
+                    Map<String, Boolean> loadedPermissions = GSON.fromJson(
+                            jsonContent, new TypeToken<Map<String, Boolean>>() {}.getType());
                     if (loadedPermissions != null) {
                         ModConfigs.commandPermissions.putAll(loadedPermissions);
-                        ModConfigs.DebugLog.info("Loaded command permissions from {}", path.toString());
+                        ModConfigs.DebugLog.info("Loaded command permissions from {}", path);
                     }
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.error("Failed to load command permissions: {}", e.getMessage());
                 }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load command permissions: {}", e.getMessage());
             }
         }
+
+        // 补齐默认值，保证菜单里读到的键一定存在
         ModConfigs.initCommandPermissions();
     }
 
     // 保存命令权限状态
     public static void saveCommandPermissions() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "REPLACE INTO command_permissions (command, need_op) VALUES (?, ?)")) {
-                
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement(
+                    "REPLACE INTO command_permissions (command, need_op) VALUES (?, ?)")) {
                 for (Map.Entry<String, Boolean> entry : ModConfigs.commandPermissions.entrySet()) {
                     stmt.setString(1, entry.getKey());
                     stmt.setBoolean(2, entry.getValue());
@@ -100,62 +108,61 @@ public class TPAHandler {
                 }
                 stmt.executeBatch();
                 ModConfigs.DebugLog.info("Saved command permissions to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save command permissions to MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to save command permissions to MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool.json");
-                Files.writeString(path, GSON.toJson(ModConfigs.commandPermissions));
-                ModConfigs.DebugLog.info("Saved command permissions to {}", path.toString());
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save command permissions: {}", e.getMessage());
-            }
+        }
+
+        try {
+            Path path = ModConfigs.getConfigDir().resolve(PERMISSIONS_FILE);
+            Files.writeString(path, GSON.toJson(ModConfigs.commandPermissions));
+            ModConfigs.DebugLog.info("Saved command permissions to {}", path);
+        } catch (IOException e) {
+            LOGGER.error("Failed to save command permissions: {}", e.getMessage());
         }
     }
 
     // 加载免打扰状态
     public static void loadToggleStates() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM toggle_states");
+        toggleStates.clear();
+
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM toggle_states");
                  ResultSet rs = stmt.executeQuery()) {
-                
-                toggleStates.clear();
                 while (rs.next()) {
-                    UUID uuid = UUID.fromString(rs.getString("player_uuid"));
-                    boolean enabled = rs.getBoolean("enabled");
-                    toggleStates.put(uuid, enabled);
+                    toggleStates.put(UUID.fromString(rs.getString("player_uuid")), rs.getBoolean("enabled"));
                 }
                 ModConfigs.DebugLog.info("Loaded toggle states from MySQL");
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load toggle states from MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to load toggle states from MySQL: {}", e.getMessage());
             }
         } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_toggles.json");
-                if (Files.exists(path)) {
+            Path path = ModConfigs.getConfigDir().resolve(TOGGLES_FILE);
+            if (Files.exists(path)) {
+                try {
                     String jsonContent = Files.readString(path);
-                    Map<UUID, Boolean> loadedToggles = GSON.fromJson(jsonContent, new TypeToken<Map<UUID, Boolean>>(){}.getType());
-                    toggleStates.clear();
+                    Map<UUID, Boolean> loadedToggles = GSON.fromJson(
+                            jsonContent, new TypeToken<Map<UUID, Boolean>>() {}.getType());
                     if (loadedToggles != null) {
                         toggleStates.putAll(loadedToggles);
-                        ModConfigs.DebugLog.info("Loaded toggle states from {}", path.toString());
+                        ModConfigs.DebugLog.info("Loaded toggle states from {}", path);
                     }
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.error("Failed to load toggle states: {}", e.getMessage());
                 }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load toggle states: {}", e.getMessage());
             }
         }
     }
 
     // 保存免打扰状态
     public static void saveToggleStates() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "REPLACE INTO toggle_states (player_uuid, enabled) VALUES (?, ?)")) {
-                
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement(
+                    "REPLACE INTO toggle_states (player_uuid, enabled) VALUES (?, ?)")) {
                 for (Map.Entry<UUID, Boolean> entry : toggleStates.entrySet()) {
                     stmt.setString(1, entry.getKey().toString());
                     stmt.setBoolean(2, entry.getValue());
@@ -163,28 +170,30 @@ public class TPAHandler {
                 }
                 stmt.executeBatch();
                 ModConfigs.DebugLog.info("Saved toggle states to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save toggle states to MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to save toggle states to MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_toggles.json");
-                Files.writeString(path, GSON.toJson(toggleStates));
-                ModConfigs.DebugLog.info("Saved toggle states to {}", path.toString());
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save toggle states: {}", e.getMessage());
-            }
+        }
+
+        try {
+            Path path = ModConfigs.getConfigDir().resolve(TOGGLES_FILE);
+            Files.writeString(path, GSON.toJson(toggleStates));
+            ModConfigs.DebugLog.info("Saved toggle states to {}", path);
+        } catch (IOException e) {
+            LOGGER.error("Failed to save toggle states: {}", e.getMessage());
         }
     }
 
     // 加载锁定玩家列表
     public static void loadLockedPlayers() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM locked_players");
+        lockedPlayers.clear();
+
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM locked_players");
                  ResultSet rs = stmt.executeQuery()) {
-                
-                lockedPlayers.clear();
                 while (rs.next()) {
                     UUID playerUUID = UUID.fromString(rs.getString("player_uuid"));
                     UUID lockedUUID = UUID.fromString(rs.getString("locked_uuid"));
@@ -192,35 +201,36 @@ public class TPAHandler {
                 }
                 ModConfigs.DebugLog.info("Loaded locked players from MySQL");
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load locked players from MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to load locked players from MySQL: {}", e.getMessage());
             }
         } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_locks.json");
-                if (Files.exists(path)) {
+            Path path = ModConfigs.getConfigDir().resolve(LOCKS_FILE);
+            if (Files.exists(path)) {
+                try {
                     String jsonContent = Files.readString(path);
-                    Map<UUID, Set<UUID>> loadedLocks = GSON.fromJson(jsonContent, new TypeToken<Map<UUID, Set<UUID>>>(){}.getType());
-                    lockedPlayers.clear();
+                    Map<UUID, Set<UUID>> loadedLocks = GSON.fromJson(
+                            jsonContent, new TypeToken<Map<UUID, Set<UUID>>>() {}.getType());
                     if (loadedLocks != null) {
                         lockedPlayers.putAll(loadedLocks);
-                        ModConfigs.DebugLog.info("Loaded locked players from {}", path.toString());
+                        ModConfigs.DebugLog.info("Loaded locked players from {}", path);
                     }
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.error("Failed to load locked players: {}", e.getMessage());
                 }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load locked players: {}", e.getMessage());
             }
         }
     }
 
     // 保存锁定玩家列表
     public static void saveLockedPlayers() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection()) {
-                // 清除现有数据
-                conn.createStatement().execute("DELETE FROM locked_players");
-                
-                String insertLock = "INSERT INTO locked_players (player_uuid, locked_uuid) VALUES (?, ?)";
-                try (PreparedStatement stmt = conn.prepareStatement(insertLock)) {
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try {
+                try (PreparedStatement clear = conn.prepareStatement("DELETE FROM locked_players")) {
+                    clear.executeUpdate();
+                }
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "INSERT INTO locked_players (player_uuid, locked_uuid) VALUES (?, ?)")) {
                     for (Map.Entry<UUID, Set<UUID>> entry : lockedPlayers.entrySet()) {
                         UUID playerUUID = entry.getKey();
                         for (UUID lockedUUID : entry.getValue()) {
@@ -232,24 +242,24 @@ public class TPAHandler {
                     stmt.executeBatch();
                 }
                 ModConfigs.DebugLog.info("Saved locked players to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save locked players to MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to save locked players to MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_locks.json");
-                Files.writeString(path, GSON.toJson(lockedPlayers));
-                ModConfigs.DebugLog.info("Saved locked players to {}", path.toString());
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save locked players: {}", e.getMessage());
-            }
+        }
+
+        try {
+            Path path = ModConfigs.getConfigDir().resolve(LOCKS_FILE);
+            Files.writeString(path, GSON.toJson(lockedPlayers));
+            ModConfigs.DebugLog.info("Saved locked players to {}", path);
+        } catch (IOException e) {
+            LOGGER.error("Failed to save locked players: {}", e.getMessage());
         }
     }
 
     @SubscribeEvent
     public static void onRegisterCommands(RegisterCommandsEvent event) {
-        detectAvailableLanguages();
-
         event.getDispatcher().register(
                 Commands.literal("tpa")
                         .requires(source -> ModConfigs.checkCommandPermission(source, "tpa"))
@@ -384,7 +394,7 @@ public class TPAHandler {
 
     private static int sendTPARequest(ServerPlayer sender, ServerPlayer target, boolean isTPHere) {
         if (sender == target) {
-            sender.sendSystemMessage(translateWithFallback("command.tpatool.tpa.self", "You cannot teleport to yourself!"));
+            sender.sendSystemMessage(translateWithFallback("command.tpatools.tpa.self", "You cannot teleport to yourself!"));
             return 0;
         }
 
@@ -395,23 +405,23 @@ public class TPAHandler {
         if (lastRequest != null && currentTime - lastRequest < cooldownMs) {
             long remainingSeconds = (cooldownMs - (currentTime - lastRequest)) / 1000;
             sender.sendSystemMessage(translateWithFallback(
-                    "command.tpatool.tpa.cooldown",
+                    "command.tpatools.tpa.cooldown",
                     "Please wait for the cooldown (%d seconds)!",
                     remainingSeconds
             ));
             return 0;
         }
         if (!target.isAlive()) {
-            sender.sendSystemMessage(translateWithFallback("command.tpatool.tpa.target_dead", "The target player is dead!"));
+            sender.sendSystemMessage(translateWithFallback("command.tpatools.tpa.target_dead", "The target player is dead!"));
             return 0;
         }
         if (toggleStates.getOrDefault(target.getUUID(), false)) {
-            sender.sendSystemMessage(translateWithFallback("command.tpatool.tpa.toggled_off", "%s has disabled TPA requests.", target.getName()));
+            sender.sendSystemMessage(translateWithFallback("command.tpatools.tpa.toggled_off", "%s has disabled TPA requests.", target.getName()));
             return 0;
         }
         Set<UUID> lockedByTarget = lockedPlayers.getOrDefault(target.getUUID(), new HashSet<>());
         if (lockedByTarget.contains(sender.getUUID())) {
-            sender.sendSystemMessage(translateWithFallback("command.tpatool.tpa.locked", "%s has locked TPA requests from you.", target.getName()));
+            sender.sendSystemMessage(translateWithFallback("command.tpatools.tpa.locked", "%s has locked TPA requests from you.", target.getName()));
             return 0;
         }
 
@@ -419,20 +429,20 @@ public class TPAHandler {
         requests.computeIfAbsent(target.getUUID(), k -> new ArrayList<>()).add(request);
 
         String senderName = sender.getName().getString();
-        MutableComponent acceptText = Component.literal("[" + translations.getOrDefault("command.tpatool.tpa.accept", "Accept") + " " + senderName + "]")
+        MutableComponent acceptText = Component.literal("[" + translations.getOrDefault("command.tpatools.tpa.accept", "Accept") + " " + senderName + "]")
                 .withStyle(style -> style.withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, "/tpaccept " + senderName))
                         .withColor(ChatFormatting.GREEN));
-        MutableComponent denyText = Component.literal("[" + translations.getOrDefault("command.tpatool.tpa.deny", "Deny") + " " + senderName + "]")
+        MutableComponent denyText = Component.literal("[" + translations.getOrDefault("command.tpatools.tpa.deny", "Deny") + " " + senderName + "]")
                 .withStyle(style -> style.withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, "/tpadeny " + senderName))
                         .withColor(ChatFormatting.RED));
         MutableComponent message = translateWithFallback(
-                isTPHere ? "command.tpatool.tpahere.received" : "command.tpatool.tpa.received",
+                isTPHere ? "command.tpatools.tpahere.received" : "command.tpatools.tpa.received",
                 isTPHere ? "%s wants you to teleport to them! Click to accept or deny." : "%s wants to teleport to you! Click to accept or deny.",
                 sender.getName()
         ).append(Component.literal("\n")).append(acceptText).append(Component.literal(" ")).append(denyText);
 
         target.sendSystemMessage(message);
-        sender.sendSystemMessage(translateWithFallback("command.tpatool.tpa.sent", "Teleport request sent to %s.", target.getName()));
+        sender.sendSystemMessage(translateWithFallback("command.tpatools.tpa.sent", "Teleport request sent to %s.", target.getName()));
         cooldowns.put(sender.getUUID(), System.currentTimeMillis());
         ModConfigs.DebugLog.log("{} request sent: {} -> {}", isTPHere ? "TPAHere" : "TPA", senderName, target.getName().getString());
         return 1;
@@ -441,7 +451,7 @@ public class TPAHandler {
     private static int acceptTPARequest(ServerPlayer target, ServerPlayer sender) {
         List<TPARequest> targetRequests = requests.get(target.getUUID());
         if (targetRequests == null || targetRequests.isEmpty()) {
-            target.sendSystemMessage(translateWithFallback("command.tpatool.tpa.no_request", "You have no pending teleport requests."));
+            target.sendSystemMessage(translateWithFallback("command.tpatools.tpa.no_request", "You have no pending teleport requests."));
             return 0;
         }
         TPARequest request;
@@ -451,14 +461,14 @@ public class TPAHandler {
                     .findFirst()
                     .orElse(null);
             if (request == null) {
-                target.sendSystemMessage(translateWithFallback("command.tpatool.tpa.no_request_from", "No teleport request from %s.", sender.getName()));
+                target.sendSystemMessage(translateWithFallback("command.tpatools.tpa.no_request_from", "No teleport request from %s.", sender.getName()));
                 return 0;
             }
         } else {
             request = targetRequests.get(targetRequests.size() - 1);
         }
         if (!request.sender.isAlive()) {
-            target.sendSystemMessage(translateWithFallback("command.tpatool.tpa.sender_dead", "The requesting player is dead!"));
+            target.sendSystemMessage(translateWithFallback("command.tpatools.tpa.sender_dead", "The requesting player is dead!"));
             targetRequests.remove(request);
             if (targetRequests.isEmpty()) {
                 requests.remove(target.getUUID());
@@ -466,29 +476,32 @@ public class TPAHandler {
             return 0;
         }
         BackHandler.recordPosition(request.isTPHere ? target : request.sender);
-        if (request.isTPHere) {
-            // 使用新的骑乘链传送方法
-            ModUtils.teleportWithAllChains(
-                    target,
-                    request.sender.serverLevel(),
-                    request.sender.getX(), request.sender.getY(), request.sender.getZ(),
-                    request.sender.getYRot(), request.sender.getXRot()
-            );
-        } else {
-            ModUtils.teleportWithAllChains(
-                    request.sender,
-                    target.serverLevel(),
-                    target.getX(), target.getY(), target.getZ(),
-                    target.getYRot(), target.getXRot()
-            );
-        }
+        Runnable teleportAction = () -> {
+            if (request.isTPHere) {
+                ModUtils.teleportWithAllChains(
+                        target,
+                        request.sender.serverLevel(),
+                        request.sender.getX(), request.sender.getY(), request.sender.getZ(),
+                        request.sender.getYRot(), request.sender.getXRot()
+                );
+            } else {
+                ModUtils.teleportWithAllChains(
+                        request.sender,
+                        target.serverLevel(),
+                        target.getX(), target.getY(), target.getZ(),
+                        target.getYRot(), target.getXRot()
+                );
+            }
+        };
+        ServerPlayer teleportingPlayer = request.isTPHere ? target : request.sender;
+        TeleportDelayManager.requestTeleport(teleportingPlayer, teleportAction);
         target.sendSystemMessage(translateWithFallback(
-                request.isTPHere ? "command.tpatool.tpahere.accepted" : "command.tpatool.tpa.accepted",
+                request.isTPHere ? "command.tpatools.tpahere.accepted" : "command.tpatools.tpa.accepted",
                 request.isTPHere ? "Accepted teleport request to %s." : "Accepted teleport request from %s.",
                 request.sender.getName()
         ));
         request.sender.sendSystemMessage(translateWithFallback(
-                "command.tpatool.tpa.accepted_by",
+                "command.tpatools.tpa.accepted_by",
                 "Your teleport request was accepted by %s!", target.getName()
         ));
         targetRequests.remove(request);
@@ -501,10 +514,40 @@ public class TPAHandler {
         return 1;
     }
 
+    /**
+     * 玩家断开连接时清理其相关状态：待处理请求、请求冷却。
+     * 避免残留的 TPARequest 持有已下线的 ServerPlayer，导致内存泄漏或向已关闭的连接发包。
+     */
+    @SubscribeEvent
+    public static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            TeleportDelayManager.clear(player.getUUID());
+            onPlayerDisconnect(player);
+        }
+    }
+
+    public static void onPlayerDisconnect(ServerPlayer player) {
+        UUID uuid = player.getUUID();
+        cooldowns.remove(uuid);
+
+        boolean changed = requests.entrySet().removeIf(entry -> {
+            if (entry.getKey().equals(uuid)) {
+                return true;
+            }
+            entry.getValue().removeIf(req ->
+                    req.sender.getUUID().equals(uuid) || req.target.getUUID().equals(uuid));
+            return entry.getValue().isEmpty();
+        });
+        if (changed) {
+            ModConfigs.DebugLog.info("Purged pending TPA requests for disconnected player {}",
+                    player.getName().getString());
+        }
+    }
+
     private static int denyTPARequest(ServerPlayer target, ServerPlayer sender) {
         List<TPARequest> targetRequests = requests.get(target.getUUID());
         if (targetRequests == null || targetRequests.isEmpty()) {
-            target.sendSystemMessage(translateWithFallback("command.tpatool.tpa.no_request", "You have no pending teleport requests."));
+            target.sendSystemMessage(translateWithFallback("command.tpatools.tpa.no_request", "You have no pending teleport requests."));
             return 0;
         }
         TPARequest request;
@@ -514,19 +557,19 @@ public class TPAHandler {
                     .findFirst()
                     .orElse(null);
             if (request == null) {
-                target.sendSystemMessage(translateWithFallback("command.tpatool.tpa.no_request_from", "No teleport request from %s.", sender.getName()));
+                target.sendSystemMessage(translateWithFallback("command.tpatools.tpa.no_request_from", "No teleport request from %s.", sender.getName()));
                 return 0;
             }
         } else {
             request = targetRequests.get(targetRequests.size() - 1);
         }
         target.sendSystemMessage(translateWithFallback(
-                request.isTPHere ? "command.tpatool.tpahere.denied" : "command.tpatool.tpa.denied",
+                request.isTPHere ? "command.tpatools.tpahere.denied" : "command.tpatools.tpa.denied",
                 request.isTPHere ? "Denied teleport request to %s." : "Denied teleport request from %s.",
                 request.sender.getName()
         ));
         request.sender.sendSystemMessage(translateWithFallback(
-                "command.tpatool.tpa.denied_by",
+                "command.tpatools.tpa.denied_by",
                 "%s denied your teleport request.", target.getName()
         ));
         targetRequests.remove(request);
@@ -546,10 +589,10 @@ public class TPAHandler {
                 if (request.sender.getUUID().equals(sender.getUUID()) && (target == null || request.target.getUUID().equals(target.getUUID()))) {
                     iterator.remove();
                     request.target.sendSystemMessage(translateWithFallback(
-                            "command.tpatool.tpa.cancelled", "%s cancelled their teleport request.", sender.getName()
+                            "command.tpatools.tpa.cancelled", "%s cancelled their teleport request.", sender.getName()
                     ));
                     sender.sendSystemMessage(translateWithFallback(
-                            "command.tpatool.tpa.cancelled_self", "Cancelled teleport request to %s.", request.target.getName()
+                            "command.tpatools.tpa.cancelled_self", "Cancelled teleport request to %s.", request.target.getName()
                     ));
                     ModConfigs.DebugLog.info("TPA request cancelled: {} -> {}", sender.getName().getString(), request.target.getName().getString());
                     cancelled = true;
@@ -559,7 +602,7 @@ public class TPAHandler {
         requests.entrySet().removeIf(entry -> entry.getValue().isEmpty());
         if (!cancelled) {
             sender.sendSystemMessage(translateWithFallback(
-                    "command.tpatool.tpa.no_requests_to_cancel", "No teleport requests to cancel."
+                    "command.tpatools.tpa.no_requests_to_cancel", "No teleport requests to cancel."
             ));
             return 0;
         }
@@ -572,7 +615,7 @@ public class TPAHandler {
         toggleStates.put(player.getUUID(), newState);
         saveToggleStates();
         player.sendSystemMessage(translateWithFallback(
-                "command.tpatool.tpa.toggle_" + (newState ? "on" : "off"),
+                "command.tpatools.tpa.toggle_" + (newState ? "on" : "off"),
                 newState ? "TPA requests are now disabled." : "TPA requests are now enabled."
         ));
         ModConfigs.DebugLog.info("Player {} toggled TPA to {}", player.getName().getString(), newState ? "off" : "on");
@@ -581,29 +624,29 @@ public class TPAHandler {
 
     private static int lockTPA(ServerPlayer player, ServerPlayer target) {
         if (player == target) {
-            player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.lock_self", "You cannot lock yourself!"));
+            player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.lock_self", "You cannot lock yourself!"));
             return 0;
         }
         Set<UUID> locked = lockedPlayers.computeIfAbsent(player.getUUID(), k -> new HashSet<>());
         if (locked.contains(target.getUUID())) {
-            player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.already_locked", "%s is already locked.", target.getName()));
+            player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.already_locked", "%s is already locked.", target.getName()));
             return 0;
         }
         locked.add(target.getUUID());
         saveLockedPlayers();
-        player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.locked_player", "Locked TPA requests from %s.", target.getName()));
+        player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.locked_player", "Locked TPA requests from %s.", target.getName()));
         ModConfigs.DebugLog.info("Player {} locked TPA from {}", player.getName().getString(), target.getName().getString());
         return 1;
     }
 
     private static int unlockTPA(ServerPlayer player, ServerPlayer target) {
         if (player == target) {
-            player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.lock_self", "You cannot unlock yourself!"));
+            player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.lock_self", "You cannot unlock yourself!"));
             return 0;
         }
         Set<UUID> locked = lockedPlayers.get(player.getUUID());
         if (locked == null || !locked.contains(target.getUUID())) {
-            player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.not_locked", "%s is not locked.", target.getName()));
+            player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.not_locked", "%s is not locked.", target.getName()));
             return 0;
         }
         locked.remove(target.getUUID());
@@ -611,7 +654,7 @@ public class TPAHandler {
             lockedPlayers.remove(player.getUUID());
         }
         saveLockedPlayers();
-        player.sendSystemMessage(translateWithFallback("command.tpatool.tpa.unlocked_player", "Unlocked TPA requests from %s.", target.getName()));
+        player.sendSystemMessage(translateWithFallback("command.tpatools.tpa.unlocked_player", "Unlocked TPA requests from %s.", target.getName()));
         ModConfigs.DebugLog.info("Player {} unlocked TPA from {}", player.getName().getString(), target.getName().getString());
         return 1;
     }

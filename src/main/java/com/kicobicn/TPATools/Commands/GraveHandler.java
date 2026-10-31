@@ -5,99 +5,95 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 import com.kicobicn.TPATools.config.ModConfigs;
 import com.kicobicn.TPATools.database.DatabaseManager;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-
 import com.kicobicn.TPATools.util.ModUtils;
+import com.kicobicn.TPATools.util.TeleportDelayManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.commands.Commands;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.Level;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
-
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
 public class GraveHandler {
-    private static final Map<UUID, BackHandler.PlayerPosition> gravePositions = new HashMap<>();
+    private static final Logger LOGGER = LogManager.getLogger("TPAtools");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String JSON_FILE = "tpatool_graves.json";
 
-    //加载死亡位置
+    private static final Map<UUID, BackHandler.PlayerPosition> gravePositions = new HashMap<>();
+
+    // 加载死亡位置
     public static void loadGraves() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM player_graves");
-                 ResultSet rs = stmt.executeQuery()) {
-                
-                gravePositions.clear();
+        gravePositions.clear();
+
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT * FROM player_graves")) {
                 while (rs.next()) {
                     UUID uuid = UUID.fromString(rs.getString("player_uuid"));
-                    String dimension = rs.getString("dimension");
-                    double x = rs.getDouble("x");
-                    double y = rs.getDouble("y");
-                    double z = rs.getDouble("z");
-                    float xRot = rs.getFloat("x_rot");
-                    float yRot = rs.getFloat("y_rot");
-                    
-                    BackHandler.PlayerPosition position = new BackHandler.PlayerPosition(
-                            null, // level will be resolved later
-                            x, y, z, yRot, xRot
-                    );
-                    // 设置维度
-                    position.dimension = ResourceLocation.fromNamespaceAndPath("minecraft", dimension);
-                    
-                    gravePositions.put(uuid, position);
+                    gravePositions.put(uuid, new BackHandler.PlayerPosition(
+                            ModUtils.parseIdentifier(rs.getString("dimension")),
+                            rs.getDouble("x"), rs.getDouble("y"), rs.getDouble("z"),
+                            rs.getFloat("y_rot"), rs.getFloat("x_rot")));
                 }
                 ModConfigs.DebugLog.info("Loaded graves from MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load graves from MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to load graves from MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_graves.json");
-                if (Files.exists(path)) {
-                    String jsonContent = Files.readString(path);
-                    Map<UUID, BackHandler.PlayerPosition> loadedGraves = GSON.fromJson(jsonContent, new TypeToken<Map<UUID, BackHandler.PlayerPosition>>(){}.getType());
-                    gravePositions.clear();
-                    if (loadedGraves != null) {
-                        gravePositions.putAll(loadedGraves);
-                        ModConfigs.DebugLog.info("Loaded graves from tpatool_graves.json");
-                    }
-                }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load graves: {}", e.getMessage());
+        }
+
+        Path path = ModConfigs.getConfigDir().resolve(JSON_FILE);
+        if (!Files.exists(path)) {
+            return;
+        }
+        try {
+            String jsonContent = Files.readString(path);
+            Map<UUID, BackHandler.PlayerPosition> loadedGraves = GSON.fromJson(
+                    jsonContent, new TypeToken<Map<UUID, BackHandler.PlayerPosition>>() {}.getType());
+            if (loadedGraves != null) {
+                gravePositions.putAll(loadedGraves);
+                ModConfigs.DebugLog.info("Loaded graves from {}", path);
             }
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Failed to load graves: {}", e.getMessage());
         }
     }
 
-    //保存死亡位置
+    // 保存死亡位置
     public static void saveGraves() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection()) {
-                // 清除现有数据
-                conn.createStatement().execute("DELETE FROM player_graves");
-                
-                String insertGrave = "INSERT INTO player_graves (player_uuid, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?)";
-                try (PreparedStatement stmt = conn.prepareStatement(insertGrave)) {
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try {
+                try (Statement clear = conn.createStatement()) {
+                    clear.executeUpdate("DELETE FROM player_graves");
+                }
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "INSERT INTO player_graves (player_uuid, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
                     for (Map.Entry<UUID, BackHandler.PlayerPosition> entry : gravePositions.entrySet()) {
-                        UUID uuid = entry.getKey();
                         BackHandler.PlayerPosition position = entry.getValue();
-                        
-                        stmt.setString(1, uuid.toString());
-                        stmt.setString(2, position.dimension.toString());
+                        stmt.setString(1, entry.getKey().toString());
+                        stmt.setString(2, ModUtils.formatIdentifier(position.dimension));
                         stmt.setDouble(3, position.x);
                         stmt.setDouble(4, position.y);
                         stmt.setDouble(5, position.z);
@@ -108,24 +104,25 @@ public class GraveHandler {
                     stmt.executeBatch();
                 }
                 ModConfigs.DebugLog.info("Saved graves to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save graves to MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to save graves to MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_graves.json");
-                Files.writeString(path, GSON.toJson(gravePositions));
-                ModConfigs.DebugLog.info("Saved graves to tpatool_graves.json");
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save graves: {}", e.getMessage());
-            }
+        }
+
+        try {
+            Path path = ModConfigs.getConfigDir().resolve(JSON_FILE);
+            Files.writeString(path, GSON.toJson(gravePositions));
+            ModConfigs.DebugLog.info("Saved graves to {}", path);
+        } catch (IOException e) {
+            LOGGER.error("Failed to save graves: {}", e.getMessage());
         }
     }
 
-    //注册指令
+    // 注册指令
     @SubscribeEvent
     public static void onRegisterCommands(RegisterCommandsEvent event) {
-
         event.getDispatcher().register(
                 Commands.literal("grave")
                         .requires(source -> ModConfigs.checkCommandPermission(source, "grave"))
@@ -133,9 +130,16 @@ public class GraveHandler {
                             try {
                                 ServerPlayer player = context.getSource().getPlayerOrException();
                                 ModConfigs.DebugLog.info("Executing /grave command for player: {}", player.getName().getString());
-                                return teleportToGrave(player);
+
+                                if (!validateGrave(player)) {
+                                    return 0;
+                                }
+
+                                // 与 /back、/home、/warp、/rtp 一致：统一走传送延迟判定
+                                TeleportDelayManager.requestTeleport(player, () -> teleportToGrave(player));
+                                return 1;
                             } catch (Exception e) {
-                                ModConfigs.DebugLog.error("Unexpected error in /grave command: ", e);
+                                LOGGER.error("Unexpected error in /grave command", e);
                                 context.getSource().sendFailure(Component.literal("An unexpected error occurred."));
                                 return 0;
                             }
@@ -143,6 +147,7 @@ public class GraveHandler {
         );
     }
 
+    // 玩家死亡时记录位置
     @SubscribeEvent
     public static void onPlayerDeath(LivingDeathEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
@@ -158,20 +163,41 @@ public class GraveHandler {
         }
     }
 
-    //传送栏
+    private static boolean validateGrave(ServerPlayer player) {
+        BackHandler.PlayerPosition pos = gravePositions.get(player.getUUID());
+        if (pos == null) {
+            player.sendSystemMessage(ModUtils.translateWithFallback(
+                    "command.tpatools.grave.no_position", "No previous death position recorded!"
+            ));
+            return false;
+        }
+        ServerLevel level = player.getServer().getLevel(
+                ResourceKey.create(Registries.DIMENSION, pos.dimension));
+        if (level == null) {
+            player.sendSystemMessage(ModUtils.translateWithFallback(
+                    "command.tpatools.grave.invalid_dimension", "Invalid dimension for death position!"
+            ));
+            gravePositions.remove(player.getUUID());
+            saveGraves();
+            return false;
+        }
+        return true;
+    }
+
+    // 传送到死亡点
     private static int teleportToGrave(ServerPlayer player) {
         BackHandler.PlayerPosition pos = gravePositions.get(player.getUUID());
         if (pos == null) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.grave.no_position", "No previous death position recorded!"
+                    "command.tpatools.grave.no_position", "No previous death position recorded!"
             ));
             return 0;
         }
-        ServerLevel level = player.getServer().getLevel(ResourceKey.create(
-                Registries.DIMENSION, pos.dimension));
+        ResourceKey<Level> dimensionKey = ResourceKey.create(Registries.DIMENSION, pos.dimension);
+        ServerLevel level = player.getServer().getLevel(dimensionKey);
         if (level == null) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.grave.invalid_dimension", "Invalid dimension for death position!"
+                    "command.tpatools.grave.invalid_dimension", "Invalid dimension for death position!"
             ));
             gravePositions.remove(player.getUUID());
             saveGraves();
@@ -187,7 +213,7 @@ public class GraveHandler {
         }
         ModUtils.teleportWithAllChains(player, level, gx, gy, gz, pos.yRot, pos.xRot);
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.grave.success", "Teleported to last death position."
+                "command.tpatools.grave.success", "Teleported to last death position."
         ));
         ModConfigs.DebugLog.info("Player {} teleported to grave at dimension={}, x={}, y={}, z={}",
                 player.getName().getString(), pos.dimension, pos.x, pos.y, pos.z);

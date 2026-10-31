@@ -7,6 +7,7 @@ import com.kicobicn.TPATools.chat.ModChatMenus;
 import com.kicobicn.TPATools.config.ModConfigs;
 import com.kicobicn.TPATools.database.DatabaseManager;
 import com.kicobicn.TPATools.util.ModUtils;
+import com.kicobicn.TPATools.util.TeleportDelayManager;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
@@ -20,6 +21,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -33,7 +36,9 @@ import java.util.*;
 public class WarpHandler {
     
     public static final Map<String, WarpPoint> warpPoints = new HashMap<>();
+    private static final Logger LOGGER = LogManager.getLogger("TPAtools");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String JSON_FILE = "tpatool_warps.json";
     
     public static class WarpPoint {
         public final String name;
@@ -53,65 +58,60 @@ public class WarpHandler {
     }
     
     // 加载 warp 点
+    // 加载 warp 点
     public static void loadWarpPoints() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM warp_points");
+        warpPoints.clear();
+
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM warp_points");
                  ResultSet rs = stmt.executeQuery()) {
-                
-                warpPoints.clear();
                 while (rs.next()) {
                     String name = rs.getString("name");
-                    String dimensionStr = rs.getString("dimension");
-                    double x = rs.getDouble("x");
-                    double y = rs.getDouble("y");
-                    double z = rs.getDouble("z");
-                    float xRot = rs.getFloat("x_rot");
-                    float yRot = rs.getFloat("y_rot");
-
-                    // 解析维度字符串为 ResourceLocation
-                    ResourceLocation dimension = ResourceLocation.parse(dimensionStr);
-
-                    // 创建 WarpPoint 对象
-                    WarpPoint warpPoint = new WarpPoint(name, dimension, x, y, z, yRot, xRot);
-                    
-                    warpPoints.put(name, warpPoint);
+                    ResourceLocation dimension = ModUtils.parseIdentifier(rs.getString("dimension"));
+                    warpPoints.put(name, new WarpPoint(name, dimension,
+                            rs.getDouble("x"), rs.getDouble("y"), rs.getDouble("z"),
+                            rs.getFloat("y_rot"), rs.getFloat("x_rot")));
                 }
                 ModConfigs.DebugLog.info("Loaded warp points from MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load warp points from MySQL: {}", e.getMessage());
-            }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_warps.json");
-                if (Files.exists(path)) {
-                    String jsonContent = Files.readString(path);
-                    Map<String, WarpPoint> loadedWarps = GSON.fromJson(jsonContent, new TypeToken<Map<String, WarpPoint>>(){}.getType());
-                    warpPoints.clear();
-                    if (loadedWarps != null) {
-                        warpPoints.putAll(loadedWarps);
-                        ModConfigs.DebugLog.info("Loaded warp points from {}", path.toString());
-                    }
-                }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load warp points: {}", e.getMessage());
+                LOGGER.error("Failed to load warp points from MySQL: {}", e.getMessage());
+                return;
             }
         }
+
+        Path path = ModConfigs.getConfigDir().resolve(JSON_FILE);
+        if (!Files.exists(path)) {
+            return;
+        }
+        try {
+            String jsonContent = Files.readString(path);
+            Map<String, WarpPoint> loadedWarps = GSON.fromJson(
+                    jsonContent, new TypeToken<Map<String, WarpPoint>>() {}.getType());
+            if (loadedWarps != null) {
+                warpPoints.putAll(loadedWarps);
+                ModConfigs.DebugLog.info("Loaded warp points from {}", path);
+            }
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Failed to load warp points: {}", e.getMessage());
+        }
     }
-    
+
     // 保存 warp 点
     public static void saveWarpPoints() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection()) {
-                // 清除现有数据
-                conn.createStatement().execute("DELETE FROM warp_points");
-                
-                String insertWarp = "INSERT INTO warp_points (name, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?)";
-                try (PreparedStatement stmt = conn.prepareStatement(insertWarp)) {
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try {
+                try (PreparedStatement clear = conn.prepareStatement("DELETE FROM warp_points")) {
+                    clear.executeUpdate();
+                }
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "INSERT INTO warp_points (name, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
                     for (Map.Entry<String, WarpPoint> entry : warpPoints.entrySet()) {
                         WarpPoint warp = entry.getValue();
                         stmt.setString(1, warp.name);
-                        stmt.setString(2, warp.dimension.toString());
+                        stmt.setString(2, ModUtils.formatIdentifier(warp.dimension));
                         stmt.setDouble(3, warp.x);
                         stmt.setDouble(4, warp.y);
                         stmt.setDouble(5, warp.z);
@@ -122,19 +122,23 @@ public class WarpHandler {
                     stmt.executeBatch();
                 }
                 ModConfigs.DebugLog.info("Saved warp points to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save warp points to MySQL: {}", e.getMessage());
-            }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_warps.json");
-                Files.writeString(path, GSON.toJson(warpPoints));
-                ModConfigs.DebugLog.info("Saved warp points to {}", path.toString());
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save warp points: {}", e.getMessage());
+                LOGGER.error("Failed to save warp points to MySQL: {}", e.getMessage());
+                return;
             }
         }
+
+        try {
+            Path path = ModConfigs.getConfigDir().resolve(JSON_FILE);
+            Files.writeString(path, GSON.toJson(warpPoints));
+            ModConfigs.DebugLog.info("Saved warp points to {}", path);
+        } catch (IOException e) {
+            LOGGER.error("Failed to save warp points: {}", e.getMessage());
+        }
     }
+    
+    // 保存 warp 点
     
     // Tab补全：warp 点名称
     private static final SuggestionProvider<CommandSourceStack> WARP_SUGGESTIONS = (context, builder) -> {
@@ -180,7 +184,13 @@ public class WarpHandler {
                                             try {
                                                 ServerPlayer player = context.getSource().getPlayerOrException();
                                                 String name = StringArgumentType.getString(context, "name");
-                                                return teleportToWarp(player, name);
+                                                if (!warpPoints.containsKey(name)) {
+                                                    player.sendSystemMessage(ModUtils.translateWithFallback(
+                                                            "command.tpatools.warp.not_found", "Warp point '%s' not found!", name));
+                                                    return 0;
+                                                }
+                                                TeleportDelayManager.requestTeleport(player, () -> teleportToWarp(player, name));
+                                                return 1;
                                             } catch (CommandSyntaxException e) {
                                                 ModConfigs.DebugLog.error("Failed to parse /warp tp: {}", e.getMessage());
                                                 context.getSource().sendFailure(Component.literal("Invalid warp name."));
@@ -222,14 +232,14 @@ public class WarpHandler {
     private static int setWarp(ServerPlayer player, String name) {
         if (warpPoints.size() >= ModConfigs.MAX_WARP_COUNT.get()) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.warp.limit_exceeded", "Warp limit exceeded! Maximum allowed: %s", ModConfigs.MAX_WARP_COUNT.get()
+                    "command.tpatools.warp.limit_exceeded", "Warp limit exceeded! Maximum allowed: %s", ModConfigs.MAX_WARP_COUNT.get()
             ));
             return 0;
         }
         
         if (warpPoints.containsKey(name)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.warp.name_exists", "Warp point '%s' already exists!", name
+                    "command.tpatools.warp.name_exists", "Warp point '%s' already exists!", name
             ));
             return 0;
         }
@@ -241,7 +251,7 @@ public class WarpHandler {
         saveWarpPoints();
         
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.warp.set", "Warp point '%s' set at your current position.", name
+                "command.tpatools.warp.set", "Warp point '%s' set at your current position.", name
         ));
         ModConfigs.DebugLog.info("Player {} set warp point {} at dimension={}, x={}, y={}, z={}",
                 player.getName().getString(), name, player.serverLevel().dimension().location(),
@@ -253,7 +263,7 @@ public class WarpHandler {
         WarpPoint warp = warpPoints.get(name);
         if (warp == null) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.warp.not_found", "Warp point '%s' not found!", name
+                    "command.tpatools.warp.not_found", "Warp point '%s' not found!", name
             ));
             return 0;
         }
@@ -262,7 +272,7 @@ public class WarpHandler {
                 Registries.DIMENSION, warp.dimension));
         if (level == null) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.warp.invalid_dimension", "Invalid dimension for warp point '%s'!", name
+                    "command.tpatools.warp.invalid_dimension", "Invalid dimension for warp point '%s'!", name
             ));
             return 0;
         }
@@ -271,7 +281,7 @@ public class WarpHandler {
         ModUtils.teleportWithAllChains(player, level, warp.x, warp.y, warp.z, warp.yRot, warp.xRot);
         
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.warp.teleported", "Teleported to warp point '%s'.", name
+                "command.tpatools.warp.teleported", "Teleported to warp point '%s'.", name
         ));
         ModConfigs.DebugLog.info("Player {} teleported to warp point {} at dimension={}, x={}, y={}, z={}",
                 player.getName().getString(), name, warp.dimension,
@@ -282,7 +292,7 @@ public class WarpHandler {
     private static int removeWarp(ServerPlayer player, String name) {
         if (!warpPoints.containsKey(name)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.warp.not_found", "Warp point '%s' not found!", name
+                    "command.tpatools.warp.not_found", "Warp point '%s' not found!", name
             ));
             return 0;
         }
@@ -291,7 +301,7 @@ public class WarpHandler {
         saveWarpPoints();
         
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.warp.removed", "Warp point '%s' removed.", name
+                "command.tpatools.warp.removed", "Warp point '%s' removed.", name
         ));
         ModConfigs.DebugLog.info("Player {} removed warp point {}", player.getName().getString(), name);
         return 1;

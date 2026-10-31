@@ -3,7 +3,8 @@ package com.kicobicn.TPATools.chat;
 import com.kicobicn.TPATools.config.ModConfigs;
 import com.kicobicn.TPATools.util.ModUtils;
 import net.minecraft.ChatFormatting;
-import net.minecraft.network.chat.*;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket;
 import net.minecraft.server.level.ServerPlayer;
@@ -12,185 +13,173 @@ import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.item.ItemStack;
 import net.minecraftforge.event.ServerChatEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class ChatHandler {
+    private static final Logger LOGGER = LogManager.getLogger("TPAtools");
 
-    // 修改正则表达式匹配 &数字 模式 (例如 &1)
-    private static final Pattern ITEM_PATTERN = Pattern.compile("&(\\d)");
+    /** &1 ~ &9：展示快捷栏对应槽位的物品 */
+    private static final Pattern ITEM_PATTERN = Pattern.compile("&([1-9])");
 
+    /** 判断单词边界用的标点集合（提及只在“完整单词”上生效，避免 Ann 命中 Anna） */
+    private static final String PUNCTUATION = " \t\n,，.。!！?？:：;；\"'“”‘’()（）[]【】<>《》-_/\\|+*~^%$#@=";
+
+    /**
+     * 用 Forge 的 {@link ServerChatEvent} 直接改写消息组件：
+     * 不需要取消原消息再手动广播，控制台日志与其它聊天处理链都不受影响。
+     */
     @SubscribeEvent
     public void onServerChat(ServerChatEvent event) {
         try {
             ServerPlayer player = event.getPlayer();
             String originalMessage = event.getRawText();
+            ModConfigs.DebugLog.info("Processing chat message from {}: {}",
+                    player.getName().getString(), originalMessage);
 
-            ModConfigs.DebugLog.info("Processing chat message from {}: {}", player.getName().getString(), originalMessage);
-
-            // 处理提到玩家功能
-            Component processedMessage = Component.nullToEmpty(processMentions(originalMessage, player));
-
-            // 处理展示物品功能
-            MutableComponent finalMessage = processItemDisplay(processedMessage, player);
-
-            // 设置处理后的消息
-            event.setMessage(finalMessage);
-            ModConfigs.DebugLog.info("Chat message processed successfully");
+            event.setMessage(buildMessage(originalMessage, player));
         } catch (Exception e) {
-            ModConfigs.DebugLog.error("Error processing chat message: {}", e.getMessage(), e);
+            LOGGER.error("Error processing chat message", e);
         }
     }
 
     /**
-     * 处理提到玩家功能 (返回Component以更好地处理颜色代码)
+     * 把原始聊天文本转换为带样式/物品组件的结果。
+     * <p>一次扫描同时处理「@提及」和「&1~&9 物品展示」两个功能。</p>
      */
-    private String processMentions(String message, ServerPlayer sender) {
-        // 获取所有在线玩家
-        var onlinePlayers = sender.getServer().getPlayerList().getPlayers();
-        String processedMessage = message; // 初始化为原消息
+    private MutableComponent buildMessage(String raw, ServerPlayer sender) {
+        List<Object> parts = new ArrayList<>();
+        Set<UUID> pinged = new HashSet<>();
 
-        for (ServerPlayer target : onlinePlayers) {
-            String playerName = target.getName().getString();
-
-            // 跳过自己
-            if (target.getUUID().equals(sender.getUUID())) {
-                continue;
-            }
-
-            // 如果消息中包含玩家名（不区分大小写）
-            if (message.toLowerCase().contains(playerName.toLowerCase())) {
-                ModConfigs.DebugLog.info("Player {} mentioned {}", sender.getName().getString(), playerName);
-
-                // 将玩家名标色
-                processedMessage = processedMessage.replaceAll("(?i)" + Pattern.quote(playerName),
-                        ChatFormatting.AQUA + playerName + ChatFormatting.RESET);
-
-                // 使用 Title 数据包来实现居中大标题提示的效果
-                ClientboundSetTitleTextPacket titlePacket =
-                        new ClientboundSetTitleTextPacket(
-                                ModUtils.translateWithFallback(
-                                        "command.tpatool.chat.mention",
-                                        "%s mentioned you",
-                                        sender.getName()
-                                ).withStyle(ChatFormatting.AQUA)
-                        );
-                // 设置标题显示时间、淡入淡出时间
-                ClientboundSetTitlesAnimationPacket timesPacket =
-                        new ClientboundSetTitlesAnimationPacket(10, 40, 10);
-                target.connection.send(timesPacket);
-                target.connection.send(titlePacket);
-
-                // 播放音效
-                target.playNotifySound(SoundEvents.NOTE_BLOCK_PLING.value(), SoundSource.PLAYERS, 1.0F, 1.0F);
-            }
-        }
-
-        // 特别处理：如果消息中包含自己的名字，也将其设置为青色
-        String senderName = sender.getName().getString();
-        if (processedMessage.contains(senderName)) {
-            processedMessage = processedMessage.replaceAll("(?i)" + Pattern.quote(senderName),
-                    ChatFormatting.AQUA + senderName + ChatFormatting.RESET);
-        }
-
-        return processedMessage;
-    }
-
-//    /**
-//     * 在Component中替换文本
-//     */
-//    private MutableComponent replaceTextInComponent(Component component, String searchText, Component replacement) {
-//        MutableComponent result = Component.literal("");
-//        String text = component.getString();
-//        int index = text.toLowerCase().indexOf(searchText.toLowerCase());
-//
-//        if (index == -1) {
-//            return Component.literal(text);
-//        }
-//
-//        // 添加前面的文本
-//        if (index > 0) {
-//            result.append(Component.literal(text.substring(0, index)));
-//        }
-//
-//        // 添加替换的组件
-//        result.append(replacement);
-//
-//        // 添加后面的文本
-//        if (index + searchText.length() < text.length()) {
-//            result.append(Component.literal(text.substring(index + searchText.length())));
-//        }
-//
-//        return result;
-//    }
-
-    /**
-     * 处理展示物品功能
-     */
-    private MutableComponent processItemDisplay(Component originalComponent, ServerPlayer player) {
-        String message = originalComponent.getString();
-        List<Object> messageParts = new ArrayList<>();
-        Matcher matcher = ITEM_PATTERN.matcher(message);
+        Matcher itemMatcher = ITEM_PATTERN.matcher(raw);
         int lastIndex = 0;
-
-        while (matcher.find()) {
-            // 添加前面的普通文本
-            if (matcher.start() > lastIndex) {
-                messageParts.add(message.substring(lastIndex, matcher.start()));
+        while (itemMatcher.find()) {
+            if (itemMatcher.start() > lastIndex) {
+                appendMentionParts(parts, raw.substring(lastIndex, itemMatcher.start()), sender, pinged);
             }
 
-            // 处理物品占位符
-            int slot = Integer.parseInt(matcher.group(1)) - 1; // 转换为0-8的索引
-            if (slot >= 0 && slot <= 8) {
-                ItemStack itemStack = player.getInventory().getItem(slot);
-                if (!itemStack.isEmpty()) {
-                    // 添加物品组件
-                    messageParts.add(createItemComponent(itemStack));
-                    ModConfigs.DebugLog.info("Replaced &{} with item: {}", slot + 1, itemStack.getDisplayName().getString());
-                } else {
-                    // 槽位为空，保留原文本
-                    messageParts.add(matcher.group(0));
-                    ModConfigs.DebugLog.info("Slot {} is empty, keeping original text", slot + 1);
+            int slot = Integer.parseInt(itemMatcher.group(1)) - 1;
+            ItemStack itemStack = sender.getInventory().getItem(slot);
+            if (!itemStack.isEmpty()) {
+                parts.add(createItemComponent(itemStack));
+                ModConfigs.DebugLog.info("Replaced &{} with item: {}", slot + 1,
+                        itemStack.getDisplayName().getString());
+            } else {
+                parts.add(itemMatcher.group(0));
+            }
+            lastIndex = itemMatcher.end();
+        }
+
+        if (lastIndex < raw.length()) {
+            appendMentionParts(parts, raw.substring(lastIndex), sender, pinged);
+        }
+
+        MutableComponent component = Component.literal("");
+        for (Object part : parts) {
+            if (part instanceof Component componentPart) {
+                component.append(componentPart);
+            } else {
+                component.append(Component.literal(String.valueOf(part)));
+            }
+        }
+        return component;
+    }
+
+    /**
+     * 按空白与标点切分文本，对「完整单词」形式的在线玩家名标色并发送提醒。
+     */
+    private void appendMentionParts(List<Object> parts, String text, ServerPlayer sender, Set<UUID> pinged) {
+        if (text.isEmpty()) {
+            return;
+        }
+
+        int index = 0;
+        int length = text.length();
+        while (index < length) {
+            // 跳过前导标点
+            int tokenStart = index;
+            while (tokenStart < length && isPunctuation(text.charAt(tokenStart))) {
+                tokenStart++;
+            }
+            if (tokenStart > index) {
+                parts.add(text.substring(index, tokenStart));
+            }
+            if (tokenStart >= length) {
+                break;
+            }
+
+            int tokenEnd = tokenStart;
+            while (tokenEnd < length && !isPunctuation(text.charAt(tokenEnd))) {
+                tokenEnd++;
+            }
+
+            String token = text.substring(tokenStart, tokenEnd);
+            ServerPlayer mentioned = resolveMention(token, sender);
+            if (mentioned != null) {
+                parts.add(Component.literal(token).withStyle(ChatFormatting.AQUA));
+                if (pinged.add(mentioned.getUUID())) {
+                    notifyMention(mentioned, sender);
                 }
             } else {
-                // 无效槽位，保留原文本
-                messageParts.add(matcher.group(0));
-                ModConfigs.DebugLog.info("Invalid slot {}, keeping original text", slot + 1);
+                parts.add(token);
             }
-
-            lastIndex = matcher.end();
+            index = tokenEnd;
         }
-
-        // 添加剩余的文本
-        if (lastIndex < message.length()) {
-            messageParts.add(message.substring(lastIndex));
-        }
-
-        // 构建最终的消息组件
-        MutableComponent finalMessage = Component.literal("");
-        for (Object part : messageParts) {
-            if (part instanceof String) {
-                finalMessage.append(Component.literal((String) part));
-            } else if (part instanceof MutableComponent) {
-                finalMessage.append((MutableComponent) part);
-            }
-        }
-
-        return finalMessage;
     }
 
-    //展示物品组件
-    private MutableComponent createItemComponent(ItemStack itemStack) {
-        // 获取物品原有的显示名称和颜色（保持其原始样式）
-        MutableComponent itemDisplayName = itemStack.getDisplayName().copy();
+    private boolean isPunctuation(char c) {
+        return PUNCTUATION.indexOf(c) >= 0;
+    }
 
-        // 构建组件：外括号为金色，物品名称为其原始颜色
-        return Component.literal("[") // 左外括号，金色
+    private ServerPlayer resolveMention(String token, ServerPlayer sender) {
+        String name = token.startsWith("@") ? token.substring(1) : token;
+        if (name.isEmpty()) {
+            return null;
+        }
+        for (ServerPlayer candidate : sender.getServer().getPlayerList().getPlayers()) {
+            if (candidate.getUUID().equals(sender.getUUID())) {
+                continue;
+            }
+            if (candidate.getName().getString().equalsIgnoreCase(name)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private void notifyMention(ServerPlayer target, ServerPlayer sender) {
+        if (target.connection == null) {
+            return;
+        }
+        ModConfigs.DebugLog.info("Player {} mentioned {}", sender.getName().getString(),
+                target.getName().getString());
+
+        ClientboundSetTitleTextPacket titlePacket = new ClientboundSetTitleTextPacket(
+                ModUtils.translateWithFallback(
+                        "command.tpatools.chat.mention",
+                        "%s mentioned you",
+                        sender.getName()).withStyle(ChatFormatting.AQUA));
+        ClientboundSetTitlesAnimationPacket timesPacket = new ClientboundSetTitlesAnimationPacket(10, 40, 10);
+        target.connection.send(timesPacket);
+        target.connection.send(titlePacket);
+
+        target.playNotifySound(SoundEvents.NOTE_BLOCK_PLING.value(), SoundSource.PLAYERS, 1.0F, 1.0F);
+    }
+
+    // 展示物品组件
+    private MutableComponent createItemComponent(ItemStack itemStack) {
+        MutableComponent itemDisplayName = itemStack.getDisplayName().copy();
+        return Component.literal("[")
                 .withStyle(ChatFormatting.GOLD)
-                .append(itemDisplayName) // 物品名称，保持原色
+                .append(itemDisplayName)
                 .append(Component.literal("]").withStyle(ChatFormatting.GOLD));
     }
 }

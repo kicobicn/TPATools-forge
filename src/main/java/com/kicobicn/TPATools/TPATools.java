@@ -7,7 +7,7 @@ import com.kicobicn.TPATools.database.DatabaseManager;
 import com.kicobicn.TPATools.util.ModUtils;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
-import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
@@ -35,6 +35,8 @@ public class TPATools {
         MinecraftForge.EVENT_BUS.register(ModConfigs.class);
         MinecraftForge.EVENT_BUS.register(ModUtils.class);
         MinecraftForge.EVENT_BUS.register(new ChatHandler());
+        // 让本类里的 @SubscribeEvent 生效（此前从未注册，导致关库逻辑是死代码）
+        MinecraftForge.EVENT_BUS.register(TPATools.class);
         MinecraftForge.EVENT_BUS.register(new Object() {
             @SubscribeEvent
             public void onServerTick(TickEvent.ServerTickEvent event) {
@@ -57,9 +59,9 @@ public class TPATools {
         DatabaseManager.initialize();
     }
 
-    // 服务器停止事件处理
+    // 服务器已停止：此时 ModUtils 的 save*() 已经执行完，再关库才不会丢数据
     @SubscribeEvent
-    public static void onServerStopping(ServerStoppingEvent event) {
+    public static void onServerStopped(ServerStoppedEvent event) {
         DatabaseManager.close();
     }
 }

@@ -7,6 +7,7 @@ import com.kicobicn.TPATools.chat.ModChatMenus;
 import com.kicobicn.TPATools.config.ModConfigs;
 import com.kicobicn.TPATools.database.DatabaseManager;
 import com.kicobicn.TPATools.util.ModUtils;
+import com.kicobicn.TPATools.util.TeleportDelayManager;
 import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -30,6 +31,8 @@ import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -44,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 public class HomeHandler {
     public static final Map<UUID, Map<String, Home>> playerHomes = new ConcurrentHashMap<>();
     public static final Map<String, Map<String, PublicHomeInfo>> publicHomesByOwner = new ConcurrentHashMap<>();
+    private static final Logger LOGGER = LogManager.getLogger("TPAtools");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
     //PublicHomeInfo 类，用于存储公开家的 UUID 和用户名
@@ -106,137 +110,114 @@ public class HomeHandler {
         }
     }
 
+    // ==================== 持久化 ====================
     public static void loadHomes() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection()) {
-                // 加载玩家家园
-                String queryHomes = "SELECT * FROM player_homes";
-                try (Statement stmt = conn.createStatement();
-                     ResultSet rs = stmt.executeQuery(queryHomes)) {
+        playerHomes.clear();
+        publicHomesByOwner.clear();
 
-                    playerHomes.clear();
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try {
+                try (Statement stmt = conn.createStatement();
+                     ResultSet rs = stmt.executeQuery("SELECT * FROM player_homes")) {
                     while (rs.next()) {
                         UUID playerUUID = UUID.fromString(rs.getString("player_uuid"));
                         String homeName = rs.getString("home_name");
-                        String dimension = rs.getString("dimension");
-                        double x = rs.getDouble("x");
-                        double y = rs.getDouble("y");
-                        double z = rs.getDouble("z");
-                        float xRot = rs.getFloat("x_rot");
-                        float yRot = rs.getFloat("y_rot");
-
-                        Home.Position pos = new Home.Position(x, y, z, xRot, yRot, ResourceLocation.fromNamespaceAndPath("minecraft", dimension));
-                        Home home = new Home(pos, new ArrayList<>());
-                        home.sharedPlayers = new ArrayList<>();
-
-                        playerHomes.computeIfAbsent(playerUUID, k -> new HashMap<>()).put(homeName, home);
+                        ResourceLocation dimension = ModUtils.parseIdentifier(rs.getString("dimension"));
+                        Home.Position pos = new Home.Position(
+                                rs.getDouble("x"), rs.getDouble("y"), rs.getDouble("z"),
+                                rs.getFloat("x_rot"), rs.getFloat("y_rot"), dimension);
+                        playerHomes.computeIfAbsent(playerUUID, k -> new HashMap<>())
+                                .put(homeName, new Home(pos, new ArrayList<>()));
                     }
                 }
 
-                // 加载家园分享
-                String queryShares = "SELECT * FROM home_shares";
                 try (Statement stmt = conn.createStatement();
-                     ResultSet rs = stmt.executeQuery(queryShares)) {
-
+                     ResultSet rs = stmt.executeQuery("SELECT * FROM home_shares")) {
                     while (rs.next()) {
                         UUID playerUUID = UUID.fromString(rs.getString("player_uuid"));
                         String homeName = rs.getString("home_name");
                         UUID sharedWith = UUID.fromString(rs.getString("shared_with"));
-
                         Map<String, Home> homes = playerHomes.get(playerUUID);
-                        if (homes != null) {
-                            Home home = homes.get(homeName);
-                            if (home != null) {
-                                home.sharedPlayers.add(sharedWith);
-                            }
+                        Home home = homes == null ? null : homes.get(homeName);
+                        if (home != null && !home.sharedPlayers.contains(sharedWith)) {
+                            home.sharedPlayers.add(sharedWith);
                         }
                     }
                 }
 
-                // 加载公开家园
-                String queryPublic = "SELECT * FROM public_homes";
                 try (Statement stmt = conn.createStatement();
-                     ResultSet rs = stmt.executeQuery(queryPublic)) {
-
-                    publicHomesByOwner.clear();
+                     ResultSet rs = stmt.executeQuery("SELECT * FROM public_homes")) {
                     while (rs.next()) {
                         UUID ownerUUID = UUID.fromString(rs.getString("player_uuid"));
                         String ownerName = rs.getString("player_name");
                         String homeName = rs.getString("home_name");
-
-                        publicHomesByOwner.computeIfAbsent(ownerName, k -> new HashMap<>())
+                        publicHomesByOwner.computeIfAbsent(ownerUUID.toString(), k -> new HashMap<>())
                                 .put(homeName, new PublicHomeInfo(ownerUUID, ownerName, homeName));
                     }
                 }
-
-                ModConfigs.DebugLog.info("Loaded homes from MySQL");
-            } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to load homes from MySQL: {}", e.getMessage());
+                ModConfigs.DebugLog.info("Loaded homes and public homes from MySQL");
+                return;
+            } catch (SQLException | RuntimeException e) {
+                LOGGER.error("Failed to load homes from MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_homes.json"); // 使用统一配置目录
-                if (Files.exists(path)) {
-                    String jsonContent = Files.readString(path);
-                    Map<String, Object> data = GSON.fromJson(jsonContent, new TypeToken<Map<String, Object>>(){}.getType());
-                    playerHomes.clear();
-                    publicHomesByOwner.clear();
+        }
 
-                    if (data != null) {
-                        // 加载 playerHomes
-                        Map<UUID, Map<String, Home>> loadedHomes = GSON.fromJson(
-                                GSON.toJson(data.get("playerHomes")), new TypeToken<Map<UUID, Map<String, Home>>>(){}.getType()
-                        );
-                        if (loadedHomes != null) {
-                            playerHomes.putAll(loadedHomes);
-                        }
-
-                        // 加载 publicHomesByOwner
-                        Map<String, Map<String, PublicHomeInfo>> loadedPublicHomes = GSON.fromJson(
-                                GSON.toJson(data.get("publicHomesByOwner")),
-                                new TypeToken<Map<String, Map<String, PublicHomeInfo>>>(){}.getType()
-                        );
-                        if (loadedPublicHomes != null) {
-                            publicHomesByOwner.putAll(loadedPublicHomes);
-                        }
-
-                        ModConfigs.DebugLog.info("Loaded homes and public homes from {}", path.toString());
-                    }
-                }
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to load homes: {}", e.getMessage());
+        Path path = ModConfigs.getConfigDir().resolve("tpatool_homes.json");
+        if (!Files.exists(path)) {
+            return;
+        }
+        try {
+            String jsonContent = Files.readString(path);
+            Map<String, Object> data = GSON.fromJson(jsonContent, new TypeToken<Map<String, Object>>() {}.getType());
+            if (data == null) {
+                return;
             }
+            Map<UUID, Map<String, Home>> loadedHomes = GSON.fromJson(
+                    GSON.toJson(data.get("playerHomes")), new TypeToken<Map<UUID, Map<String, Home>>>() {}.getType());
+            if (loadedHomes != null) {
+                playerHomes.putAll(loadedHomes);
+            }
+            Map<String, Map<String, PublicHomeInfo>> loadedPublicHomes = GSON.fromJson(
+                    GSON.toJson(data.get("publicHomesByOwner")),
+                    new TypeToken<Map<String, Map<String, PublicHomeInfo>>>() {}.getType());
+            if (loadedPublicHomes != null) {
+                publicHomesByOwner.putAll(loadedPublicHomes);
+            }
+            ModConfigs.DebugLog.info("Loaded homes and public homes from {}", path);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Failed to load homes: {}", e.getMessage());
         }
     }
 
     public static void saveHomes() {
-        if (DatabaseManager.isUsingMySQL()) {
-            try (Connection conn = DatabaseManager.getConnection()) {
-                // 清除现有数据
-                conn.createStatement().execute("DELETE FROM home_shares");
-                conn.createStatement().execute("DELETE FROM public_homes");
-                conn.createStatement().execute("DELETE FROM player_homes");
+        Connection conn = DatabaseManager.getConnection();
+        if (conn != null) {
+            try {
+                // 先删子表再删主表，避免外键约束报错
+                try (Statement clear = conn.createStatement()) {
+                    clear.executeUpdate("DELETE FROM home_shares");
+                    clear.executeUpdate("DELETE FROM public_homes");
+                    clear.executeUpdate("DELETE FROM player_homes");
+                }
 
-                // 保存玩家家园
-                String insertHome = "INSERT INTO player_homes (player_uuid, home_name, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                String insertShare = "INSERT INTO home_shares (player_uuid, home_name, shared_with) VALUES (?, ?, ?)";
-                String insertPublic = "INSERT INTO public_homes (player_uuid, player_name, home_name) VALUES (?, ?, ?)";
-
-                try (PreparedStatement homeStmt = conn.prepareStatement(insertHome);
-                     PreparedStatement shareStmt = conn.prepareStatement(insertShare);
-                     PreparedStatement publicStmt = conn.prepareStatement(insertPublic)) {
+                try (PreparedStatement homeStmt = conn.prepareStatement(
+                             "INSERT INTO player_homes (player_uuid, home_name, dimension, x, y, z, x_rot, y_rot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+                     PreparedStatement shareStmt = conn.prepareStatement(
+                             "INSERT INTO home_shares (player_uuid, home_name, shared_with) VALUES (?, ?, ?)");
+                     PreparedStatement publicStmt = conn.prepareStatement(
+                             "INSERT INTO public_homes (player_uuid, player_name, home_name) VALUES (?, ?, ?)")) {
 
                     for (Map.Entry<UUID, Map<String, Home>> playerEntry : playerHomes.entrySet()) {
                         UUID playerUUID = playerEntry.getKey();
-
                         for (Map.Entry<String, Home> homeEntry : playerEntry.getValue().entrySet()) {
                             String homeName = homeEntry.getKey();
                             Home home = homeEntry.getValue();
 
-                            // 保存家园
                             homeStmt.setString(1, playerUUID.toString());
                             homeStmt.setString(2, homeName);
-                            homeStmt.setString(3, home.position.dimension.toString());
+                            homeStmt.setString(3, ModUtils.formatIdentifier(home.position.dimension));
                             homeStmt.setDouble(4, home.position.x);
                             homeStmt.setDouble(5, home.position.y);
                             homeStmt.setDouble(6, home.position.z);
@@ -244,7 +225,6 @@ public class HomeHandler {
                             homeStmt.setFloat(8, home.position.yRot);
                             homeStmt.addBatch();
 
-                            // 保存分享
                             for (UUID sharedWith : home.sharedPlayers) {
                                 shareStmt.setString(1, playerUUID.toString());
                                 shareStmt.setString(2, homeName);
@@ -254,68 +234,56 @@ public class HomeHandler {
                         }
                     }
 
-                    // 保存公开家园
                     for (Map.Entry<String, Map<String, PublicHomeInfo>> ownerEntry : publicHomesByOwner.entrySet()) {
-                        String ownerName = ownerEntry.getKey();
-
                         for (Map.Entry<String, PublicHomeInfo> homeEntry : ownerEntry.getValue().entrySet()) {
-                            String homeName = homeEntry.getKey();
                             PublicHomeInfo info = homeEntry.getValue();
-
                             publicStmt.setString(1, info.ownerUUID.toString());
-                            publicStmt.setString(2, ownerName);
-                            publicStmt.setString(3, homeName);
+                            publicStmt.setString(2, info.ownerName == null ? "Unknown" : info.ownerName);
+                            publicStmt.setString(3, homeEntry.getKey());
                             publicStmt.addBatch();
                         }
                     }
 
-                    // 执行批处理
                     homeStmt.executeBatch();
                     shareStmt.executeBatch();
                     publicStmt.executeBatch();
                 }
-
-                ModConfigs.DebugLog.info("Saved homes to MySQL");
+                ModConfigs.DebugLog.info("Saved homes and public homes to MySQL");
+                return;
             } catch (SQLException e) {
-                ModConfigs.DebugLog.error("Failed to save homes to MySQL: {}", e.getMessage());
+                LOGGER.error("Failed to save homes to MySQL: {}", e.getMessage());
+                return;
             }
-        } else {
-            try {
-                Path path = ModConfigs.getConfigDir().resolve("tpatool_homes.json"); // 使用统一配置目录
-                MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-                Map<String, Object> data = new HashMap<>();
-                data.put("playerHomes", playerHomes);
+        }
 
-                // 公开家园的保存格式
-                Map<String, Map<String, PublicHomeInfo>> publicHomesData = new HashMap<>();
-                for (Map.Entry<String, Map<String, PublicHomeInfo>> ownerEntry : publicHomesByOwner.entrySet()) {
-                    String ownerUUID = ownerEntry.getKey();
-                    Map<String, PublicHomeInfo> homes = ownerEntry.getValue();
+        try {
+            Path path = ModConfigs.getConfigDir().resolve("tpatool_homes.json");
+            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+            Map<String, Object> data = new HashMap<>();
+            data.put("playerHomes", playerHomes);
 
-                    Map<String, PublicHomeInfo> ownerPublicHomes = new HashMap<>();
-                    for (Map.Entry<String, PublicHomeInfo> homeEntry : homes.entrySet()) {
-                        String homeName = homeEntry.getKey();
-                        PublicHomeInfo info = homeEntry.getValue();
-
-                        // 确保所有者名称是最新的
-                        String ownerName = info.ownerName != null ? info.ownerName :
-                                (server != null && server.getProfileCache() != null ?
-                                        server.getProfileCache().get(UUID.fromString(ownerUUID))
-                                                .map(GameProfile::getName).orElse("Unknown") : "Unknown");
-
-                        ownerPublicHomes.put(homeName, new PublicHomeInfo(
-                                UUID.fromString(ownerUUID), ownerName, homeName
-                        ));
-                    }
-                    publicHomesData.put(ownerUUID, ownerPublicHomes);
+            Map<String, Map<String, PublicHomeInfo>> publicHomesData = new HashMap<>();
+            for (Map.Entry<String, Map<String, PublicHomeInfo>> ownerEntry : publicHomesByOwner.entrySet()) {
+                String ownerUUID = ownerEntry.getKey();
+                Map<String, PublicHomeInfo> ownerPublicHomes = new HashMap<>();
+                for (Map.Entry<String, PublicHomeInfo> homeEntry : ownerEntry.getValue().entrySet()) {
+                    String homeName = homeEntry.getKey();
+                    PublicHomeInfo info = homeEntry.getValue();
+                    String ownerName = info.ownerName != null ? info.ownerName
+                            : (server != null && server.getProfileCache() != null
+                                    ? server.getProfileCache().get(UUID.fromString(ownerUUID))
+                                            .map(GameProfile::getName).orElse("Unknown")
+                                    : "Unknown");
+                    ownerPublicHomes.put(homeName, new PublicHomeInfo(UUID.fromString(ownerUUID), ownerName, homeName));
                 }
-                data.put("publicHomesByOwner", publicHomesData);
-
-                Files.writeString(path, GSON.toJson(data));
-                ModConfigs.DebugLog.info("Saved homes and public homes to {}", path.toString());
-            } catch (IOException e) {
-                ModConfigs.DebugLog.error("Failed to save homes: {}", e.getMessage());
+                publicHomesData.put(ownerUUID, ownerPublicHomes);
             }
+            data.put("publicHomesByOwner", publicHomesData);
+
+            Files.writeString(path, GSON.toJson(data));
+            ModConfigs.DebugLog.info("Saved homes and public homes to {}", path);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Failed to save homes: {}", e.getMessage());
         }
     }
 
@@ -468,7 +436,15 @@ public class HomeHandler {
                         .then(Commands.literal("tp")
                                 .then(Commands.argument("name", StringArgumentType.string())
                                         .suggests(ACCESSIBLE_HOME_SUGGESTIONS)
-                                        .executes(context -> teleportToHome(context.getSource().getPlayerOrException(), StringArgumentType.getString(context, "name")))))
+                                        .executes(context -> {
+                                            ServerPlayer player = context.getSource().getPlayerOrException();
+                                            String homeName = StringArgumentType.getString(context, "name");
+                                            if (!validateHomeAccessible(player, homeName)) {
+                                                return 0;
+                                            }
+                                            TeleportDelayManager.requestTeleport(player, () -> teleportToHome(player, homeName));
+                                            return 1;
+                                        })))
                         .then(Commands.literal("set")
                                 .then(Commands.argument("name", StringArgumentType.string())
                                         .executes(context -> setHome(context.getSource().getPlayerOrException(), StringArgumentType.getString(context, "name")))))
@@ -519,7 +495,15 @@ public class HomeHandler {
                         .then(Commands.literal("otherhome")
                                 .then(Commands.argument("home", StringArgumentType.greedyString())
                                         .suggests(OTHER_HOME_SUGGESTIONS)
-                                        .executes(context -> teleportToOtherHome(context.getSource().getPlayerOrException(), StringArgumentType.getString(context, "home")))))
+                                        .executes(context -> {
+                                            ServerPlayer player = context.getSource().getPlayerOrException();
+                                            String homeArg = StringArgumentType.getString(context, "home");
+                                            if (!validateOtherHomeExists(player, homeArg)) {
+                                                return 0;
+                                            }
+                                            TeleportDelayManager.requestTeleport(player, () -> teleportToOtherHome(player, homeArg));
+                                            return 1;
+                                        })))
                         .then(Commands.literal("otherlist")
                                 .executes(context -> {
                                     ServerPlayer player = context.getSource().getPlayerOrException();
@@ -566,7 +550,6 @@ public class HomeHandler {
                                         .executes(context -> unshareHome(
                                                 context.getSource().getPlayerOrException(),
                                                 StringArgumentType.getString(context, "name"),
-                                                null,
                                                 null
                                         ))
                                         .then(Commands.argument("player", StringArgumentType.string())
@@ -574,8 +557,7 @@ public class HomeHandler {
                                                 .executes(context -> unshareHome(
                                                         context.getSource().getPlayerOrException(),
                                                         StringArgumentType.getString(context, "name"),
-                                                        StringArgumentType.getString(context, "player"),
-                                                        context.getSource()
+                                                        StringArgumentType.getString(context, "player")
                                                 )))))
                         .then(Commands.literal("invite")
                                 .then(Commands.literal("invite")
@@ -630,13 +612,13 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.computeIfAbsent(player.getUUID(), k -> new HashMap<>());
         if (homes.size() >= ModConfigs.MAX_HOMES.get()) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.limit_exceeded", "You have reached the maximum number of homes (%s)!", ModConfigs.MAX_HOMES.get()
+                    "command.tpatools.home.limit_exceeded", "You have reached the maximum number of homes (%s)!", ModConfigs.MAX_HOMES.get()
             ));
             return 0;
         }
         if (homes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.name_exists", "A home named %s already exists!", homeName
+                    "command.tpatools.home.name_exists", "A home named %s already exists!", homeName
             ));
             return 0;
         }
@@ -648,7 +630,7 @@ public class HomeHandler {
         homes.put(homeName, new Home(position, new ArrayList<>()));
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.set", "Home %s set at your current position.", homeName
+                "command.tpatools.home.set", "Home %s set at your current position.", homeName
         ));
         ModConfigs.DebugLog.info("Player {} set home {} at {}", player.getName().getString(), homeName, dimension);
         return 1;
@@ -663,7 +645,7 @@ public class HomeHandler {
                     Registries.DIMENSION, home.position.dimension));
             if (level == null) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.invalid_dimension", "Invalid dimension for home %s!", name
+                        "command.tpatools.home.invalid_dimension", "Invalid dimension for home %s!", name
                 ));
                 return 0;
             }
@@ -675,10 +657,10 @@ public class HomeHandler {
                 homeY = safePos.getY();
                 homeZ = safePos.getZ() + 0.5;
             }
-            player.teleportTo(level, homeX, homeY, homeZ,
+            ModUtils.teleportWithAllChains(player, level, homeX, homeY, homeZ,
                     home.position.yRot, home.position.xRot);
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.teleported", "Teleported to home %s.", name
+                    "command.tpatools.home.teleported", "Teleported to home %s.", name
             ));
             ModConfigs.DebugLog.info("Player {} teleported to home {} at dimension={}, x={}, y={}, z={}",
                     player.getName().getString(), name, home.position.dimension,
@@ -693,7 +675,7 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(name)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", name
+                    "command.tpatools.home.not_found", "Home %s not found!", name
             ));
             return 0;
         }
@@ -715,7 +697,7 @@ public class HomeHandler {
 
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.removed", "Home %s removed.", name
+                "command.tpatools.home.removed", "Home %s removed.", name
         ));
         ModConfigs.DebugLog.info("Player {} removed home {}", player.getName().getString(), name);
         return 1;
@@ -725,13 +707,13 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(oldName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", oldName
+                    "command.tpatools.home.not_found", "Home %s not found!", oldName
             ));
             return 0;
         }
         if (homes.containsKey(newName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.name_exists", "A home named %s already exists!", newName
+                    "command.tpatools.home.name_exists", "A home named %s already exists!", newName
             ));
             return 0;
         }
@@ -749,7 +731,7 @@ public class HomeHandler {
 
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.renamed", "Home %s renamed to %s.", oldName, newName
+                "command.tpatools.home.renamed", "Home %s renamed to %s.", oldName, newName
         ));
         ModConfigs.DebugLog.info("Player {} renamed home {} to {}", player.getName().getString(), oldName, newName);
         return 1;
@@ -760,35 +742,35 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(name)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", name
+                    "command.tpatools.home.not_found", "Home %s not found!", name
             ));
             return 0;
         }
         Home home = homes.get(name);
         if (home.sharedPlayers.contains(target.getUUID())) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.already_shared", "Home %s is already shared with %s!", name, target.getName()
+                    "command.tpatools.home.already_shared", "Home %s is already shared with %s!", name, target.getName()
             ));
             return 0;
         }
         home.sharedPlayers.add(target.getUUID());
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.shared", "Home %s shared with %s.", name, target.getName()
+                "command.tpatools.home.shared", "Home %s shared with %s.", name, target.getName()
         ));
         target.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.shared_received", "%s shared their home %s with you.", player.getName(), name
+                "command.tpatools.home.shared_received", "%s shared their home %s with you.", player.getName(), name
         ));
         ModConfigs.DebugLog.info("Player {} shared home {} with {}", player.getName().getString(), name, target.getName().getString());
         return 1;
     }
 
     //unshareHome 方法
-    private static int unshareHome(ServerPlayer player, String homeName, String targetPlayerName, CommandSourceStack source) {
+    private static int unshareHome(ServerPlayer player, String homeName, String targetPlayerName) {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", homeName
+                    "command.tpatools.home.not_found", "Home %s not found!", homeName
             ));
             return 0;
         }
@@ -796,13 +778,13 @@ public class HomeHandler {
         if (targetPlayerName == null) {
             if (home.sharedPlayers.isEmpty()) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.unshare.no_players", "Home %s is not shared with anyone!", homeName
+                        "command.tpatools.unshare.no_players", "Home %s is not shared with anyone!", homeName
                 ));
                 return 0;
             }
             home.sharedPlayers.clear();
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.unshare.all", "Removed sharing of home %s for all players.", homeName
+                    "command.tpatools.unshare.all", "Removed sharing of home %s for all players.", homeName
             ));
             saveHomes();
             return 1;
@@ -811,25 +793,25 @@ public class HomeHandler {
             Optional<GameProfile> profile = server.getProfileCache().get(targetPlayerName);
             if (profile.isEmpty()) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.unshare.player_not_found", "Player %s not found!", targetPlayerName
+                        "command.tpatools.unshare.player_not_found", "Player %s not found!", targetPlayerName
                 ));
                 return 0;
             }
             UUID targetUUID = profile.get().getId();
             if (!home.sharedPlayers.contains(targetUUID)) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.unshare.not_shared", "Home %s is not shared with %s!", homeName, targetPlayerName
+                        "command.tpatools.unshare.no_share", "Home %s is not shared with %s!", homeName, targetPlayerName
                 ));
                 return 0;
             }
             home.sharedPlayers.remove(targetUUID);
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.unshare.player", "Removed sharing of home %s with %s.", homeName, targetPlayerName
+                    "command.tpatools.unshare.player", "Removed sharing of home %s with %s.", homeName, targetPlayerName
             ));
             ServerPlayer targetPlayer = server.getPlayerList().getPlayer(targetUUID);
             if (targetPlayer != null) {
                 targetPlayer.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.unshare.notify", "%s has removed sharing of their home %s with you.", player.getName().getString(), homeName
+                        "command.tpatools.unshare.notify", "%s has removed sharing of their home %s with you.", player.getName().getString(), homeName
                 ));
             }
             saveHomes();
@@ -842,7 +824,7 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", homeName
+                    "command.tpatools.home.not_found", "Home %s not found!", homeName
             ));
             return 0;
         }
@@ -851,7 +833,7 @@ public class HomeHandler {
         Map<String, PublicHomeInfo> ownerPublicHomes = publicHomesByOwner.get(player.getUUID().toString());
         if (ownerPublicHomes != null && ownerPublicHomes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.already_public", "Home %s is already public!", homeName
+                    "command.tpatools.home.already_public", "Home %s is already public!", homeName
             ));
             return 0;
         }
@@ -866,7 +848,7 @@ public class HomeHandler {
 
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.publicized", "Home %s is now public.", homeName
+                "command.tpatools.home.publicized", "Home %s is now public.", homeName
         ));
         ModConfigs.DebugLog.info("Player {} set home {} as public.", player.getName().getString(), homeName);
         return 1;
@@ -876,7 +858,7 @@ public class HomeHandler {
         Map<String, Home> homes = playerHomes.get(player.getUUID());
         if (homes == null || !homes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_found", "Home %s not found!", homeName
+                    "command.tpatools.home.not_found", "Home %s not found!", homeName
             ));
             return 0;
         }
@@ -884,7 +866,7 @@ public class HomeHandler {
         Map<String, PublicHomeInfo> ownerPublicHomes = publicHomesByOwner.get(player.getUUID().toString());
         if (ownerPublicHomes == null || !ownerPublicHomes.containsKey(homeName)) {
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.not_public", "Home %s is not public!", homeName
+                    "command.tpatools.home.not_public", "Home %s is not public!", homeName
             ));
             return 0;
         }
@@ -897,7 +879,7 @@ public class HomeHandler {
 
         saveHomes();
         player.sendSystemMessage(ModUtils.translateWithFallback(
-                "command.tpatool.home.privatized", "Home %s is no longer public.", homeName
+                "command.tpatools.home.privatized", "Home %s is no longer public.", homeName
         ));
         ModConfigs.DebugLog.info("Player {} set home {} as private.", player.getName().getString(), homeName);
         return 1;
@@ -908,7 +890,7 @@ public class HomeHandler {
             String[] parts = homeArg.split(":", 2);
             if (parts.length != 2) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.invalid_format", "Invalid format! Use playername:homename."
+                        "command.tpatools.home.invalid_format", "Invalid format! Use playername:homename."
                 ));
                 return 0;
             }
@@ -918,7 +900,7 @@ public class HomeHandler {
             Optional<GameProfile> profile = player.getServer().getProfileCache().get(ownerName);
             if (profile.isEmpty()) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.other_not_found", "Home %s not found or not accessible!", homeArg
+                        "command.tpatools.home.other_not_found", "Home %s not found or not accessible!", homeArg
                 ));
                 return 0;
             }
@@ -932,7 +914,7 @@ public class HomeHandler {
             Map<String, Home> homes = playerHomes.get(ownerUUID);
             if (homes == null || !homes.containsKey(homeName)) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.other_not_found", "Home %s not found or not accessible!", homeArg
+                        "command.tpatools.home.other_not_found", "Home %s not found or not accessible!", homeArg
                 ));
                 return 0;
             }
@@ -940,7 +922,7 @@ public class HomeHandler {
 
             if (!isPublic && !home.sharedPlayers.contains(player.getUUID())) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.other_not_found", "Home %s not found or not accessible!", homeArg
+                        "command.tpatools.home.other_not_found", "Home %s not found or not accessible!", homeArg
                 ));
                 return 0;
             }
@@ -949,7 +931,7 @@ public class HomeHandler {
             ServerLevel targetLevel = player.getServer().getLevel(dimensionKey);
             if (targetLevel == null) {
                 player.sendSystemMessage(ModUtils.translateWithFallback(
-                        "command.tpatool.home.invalid_dimension", "Invalid dimension for home %s!", homeArg
+                        "command.tpatools.home.invalid_dimension", "Invalid dimension for home %s!", homeArg
                 ));
                 return 0;
             }
@@ -962,20 +944,17 @@ public class HomeHandler {
                 homeY = safePos.getY();
                 homeZ = safePos.getZ() + 0.5;
             }
-            player.teleportTo(
-                    targetLevel,
-                    homeX, homeY, homeZ,
-                    home.position.xRot, home.position.yRot
-            );
+            ModUtils.teleportWithAllChains(player, targetLevel, homeX, homeY, homeZ,
+                    home.position.yRot, home.position.xRot);
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.home.other_teleported", "Teleported to %s's home %s.", ownerName, homeName
+                    "command.tpatools.home.other_teleported", "Teleported to %s's home %s.", ownerName, homeName
             ));
             ModConfigs.DebugLog.info("Player {} teleported to {}'s home {}", player.getName().getString(), ownerName, homeName);
             return 1;
         } catch (Exception e) {
             ModConfigs.DebugLog.error("Error executing /home otherhome {}: {}", homeArg, e.getMessage());
             player.sendSystemMessage(ModUtils.translateWithFallback(
-                    "command.tpatool.error", "An unexpected error occurred while executing the command."
+                    "command.tpatools.error", "An unexpected error occurred while executing the command."
             ));
             return 0;
         }
@@ -983,7 +962,7 @@ public class HomeHandler {
 
     private static int sendInvite(CommandSourceStack source, ServerPlayer sender, ServerPlayer target, String homeName) {
         if (sender.getUUID().equals(target.getUUID())) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.self", "You cannot invite yourself!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.self", "You cannot invite yourself!"));
             return 0;
         }
 
@@ -992,14 +971,17 @@ public class HomeHandler {
         long lastInviteTime = inviteCooldowns.getOrDefault(cooldownKey, 0L);
         long cooldownMs = ModConfigs.HOME_INVITE_COOLDOWN.get() * 1000L;
 
+        // 清理已过期的冷却记录，避免长期运行后无限增长
+        inviteCooldowns.entrySet().removeIf(entry -> currentTime - entry.getValue() > Math.max(cooldownMs, 60_000L));
+
         if (currentTime - lastInviteTime < cooldownMs) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.cooldown", "Please wait before sending another invite!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.cooldown", "Please wait before sending another invite!"));
             return 0;
         }
 
         Map<String, Home> senderHomes = playerHomes.get(sender.getUUID());
         if (senderHomes == null || !senderHomes.containsKey(homeName)) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_home", "You don't have a home with that name!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_home", "You don't have a home with that name!"));
             return 0;
         }
 
@@ -1022,7 +1004,7 @@ public class HomeHandler {
         inviteCooldowns.put(cooldownKey, currentTime);
 
         MutableComponent senderMsg = Component.literal("")
-                .append(ModUtils.translateWithFallback("command.tpatool.home.invite.send_success", "An invitation to visit the home '%s' has been sent to %s.", target.getName().getString(), homeName)
+                .append(ModUtils.translateWithFallback("command.tpatools.home.invite.send_success", "An invitation to visit the home '%s' has been sent to %s.", target.getName().getString(), homeName)
                         .withStyle(ChatFormatting.GRAY))
                 .append(ModChatMenus.createButton(
                         " [取消]",
@@ -1034,7 +1016,7 @@ public class HomeHandler {
 
         sender.sendSystemMessage(senderMsg);
 
-        MutableComponent targetMsg = ModUtils.translateWithFallback("command.tpatool.home.invite.receive_info", "%s invites you to visit their home '%s'.", sender.getName().getString(), homeName)
+        MutableComponent targetMsg = ModUtils.translateWithFallback("command.tpatools.home.invite.receive_info", "%s invites you to visit their home '%s'.", sender.getName().getString(), homeName)
                 .withStyle(ChatFormatting.GRAY)
                 .append(Component.literal("  "))
                 .append(ModChatMenus.createI18nButton(
@@ -1069,7 +1051,7 @@ public class HomeHandler {
                         ServerPlayer timeoutSender = sender.getServer().getPlayerList().getPlayer(sender.getUUID());
                         if (timeoutSender != null) {
                             timeoutSender.sendSystemMessage(ModUtils.translateWithFallback(
-                                    "command.tpatool.home.invite.timeout", 
+                                    "command.tpatools.home.invite.timeout", 
                                     "Your invite to %s for home '%s' has timed out.", 
                                     target.getName(), homeName));
                         }
@@ -1078,7 +1060,7 @@ public class HomeHandler {
                         ServerPlayer timeoutTarget = target.getServer().getPlayerList().getPlayer(target.getUUID());
                         if (timeoutTarget != null) {
                             timeoutTarget.sendSystemMessage(ModUtils.translateWithFallback(
-                                    "command.tpatool.home.invite.timeout_received", 
+                                    "command.tpatools.home.invite.timeout_received", 
                                     "The invite from %s for home '%s' has timed out.", 
                                     sender.getName(), homeName));
                         }
@@ -1100,7 +1082,7 @@ public class HomeHandler {
     private static int cancelInvite(CommandSourceStack source, ServerPlayer sender, ServerPlayer target) {
         List<InviteRequest> invites = pendingInvites.get(target.getUUID());
         if (invites == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_pending", "No pending invites to cancel."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_pending", "No pending invites to cancel."));
             return 0;
         }
 
@@ -1109,7 +1091,7 @@ public class HomeHandler {
             pendingInvites.remove(target.getUUID());
         }
 
-        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.cancelled", "Invite to %s has been cancelled.", target.getName().getString()), true);
+        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.cancelled", "Invite to %s has been cancelled.", target.getName().getString()), true);
         return 1;
     }
 
@@ -1119,21 +1101,20 @@ public class HomeHandler {
         for (Iterator<Map.Entry<UUID, List<InviteRequest>>> it = pendingInvites.entrySet().iterator(); it.hasNext();) {
             Map.Entry<UUID, List<InviteRequest>> entry = it.next();
             List<InviteRequest> invites = entry.getValue();
+            int before = invites.size();
             invites.removeIf(req -> req.senderUUID.equals(sender.getUUID()));
+            if (invites.size() < before) {
+                cancelledAny = true;
+            }
             if (invites.isEmpty()) {
                 it.remove();
-            } else {
-                entry.setValue(invites);
-            }
-            if (invites.size() < entry.getValue().size()) {
-                cancelledAny = true;
             }
         }
 
         if (cancelledAny) {
-            source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.cancelled_all", "All pending invites have been cancelled."), true);
+            source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.cancelled_all", "All pending invites have been cancelled."), true);
         } else {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_pending", "No pending invites to cancel."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_pending", "No pending invites to cancel."));
         }
 
         return cancelledAny ? 1 : 0;
@@ -1142,7 +1123,7 @@ public class HomeHandler {
     private static int acceptInvite(CommandSourceStack source, ServerPlayer receiver, ServerPlayer sender) {
         List<InviteRequest> invites = pendingInvites.get(receiver.getUUID());
         if (invites == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_from_player", "No pending invites from that player."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_from_player", "No pending invites from that player."));
             return 0;
         }
 
@@ -1155,24 +1136,28 @@ public class HomeHandler {
         }
 
         if (foundInvite == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_from_player", "No pending invite from that player."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_from_player", "No pending invite from that player."));
             return 0;
         }
 
         // 传送玩家
         Map<String, Home> senderHomes = playerHomes.get(foundInvite.senderUUID);
         if (senderHomes == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_home_exists", "The sender's homes no longer exist!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_home_exists", "The sender's homes no longer exist!"));
             return 0;
         }
 
         Home senderHome = senderHomes.get(foundInvite.homeName);
         if (senderHome == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.home_no_exists", "The home no longer exists!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.home_no_exists", "The home no longer exists!"));
             return 0;
         }
 
-        teleportPlayer(receiver, senderHome.position.x, senderHome.position.y, senderHome.position.z, senderHome.position.dimension);
+        BackHandler.recordPosition(receiver);
+        final Home acceptedHome = senderHome;
+        TeleportDelayManager.requestTeleport(receiver, () -> teleportPlayer(receiver,
+                acceptedHome.position.x, acceptedHome.position.y, acceptedHome.position.z,
+                acceptedHome.position.dimension));
 
         // 移除邀请
         invites.remove(foundInvite);
@@ -1182,15 +1167,15 @@ public class HomeHandler {
 
         final String homeNameFinal = foundInvite.homeName;
 
-        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.accepted", "Invite accepted! Teleporting to %s.", homeNameFinal), true);
-        sender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatool.home.invite.accepted_by", "Your teleport request was accepted by %s!", receiver.getName()));
+        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.accepted", "Invite accepted! Teleporting to %s.", homeNameFinal), true);
+        sender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatools.home.invite.accepted_by", "Your teleport request was accepted by %s!", receiver.getName()));
         return 1;
     }
 
     private static int acceptLatestInvite(CommandSourceStack source, ServerPlayer receiver) {
         List<InviteRequest> invites = pendingInvites.get(receiver.getUUID());
         if (invites == null || invites.isEmpty()) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_invites", "No pending invites."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_invites", "No pending invites."));
             return 0;
         }
 
@@ -1205,17 +1190,21 @@ public class HomeHandler {
         // 传送玩家
         Map<String, Home> senderHomes = playerHomes.get(latestInvite.senderUUID);
         if (senderHomes == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_home_exists", "The sender's homes no longer exist!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_home_exists", "The sender's homes no longer exist!"));
             return 0;
         }
 
         Home senderHome = senderHomes.get(latestInvite.homeName);
         if (senderHome == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.home_no_exists", "The home no longer exists!"));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.home_no_exists", "The home no longer exists!"));
             return 0;
         }
 
-        teleportPlayer(receiver, senderHome.position.x, senderHome.position.y, senderHome.position.z, senderHome.position.dimension);
+        BackHandler.recordPosition(receiver);
+        final Home acceptedHome = senderHome;
+        TeleportDelayManager.requestTeleport(receiver, () -> teleportPlayer(receiver,
+                acceptedHome.position.x, acceptedHome.position.y, acceptedHome.position.z,
+                acceptedHome.position.dimension));
 
         // 移除邀请
         invites.remove(latestInvite);
@@ -1226,10 +1215,10 @@ public class HomeHandler {
 
         final String homeNameFinal = latestInvite.homeName;
 
-        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.accepted", "Invite accepted! Teleporting to %s.", homeNameFinal), true);
+        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.accepted", "Invite accepted! Teleporting to %s.", homeNameFinal), true);
         ServerPlayer latestInviteSender = receiver.getServer().getPlayerList().getPlayer(latestInvite.senderUUID);
         if (latestInviteSender != null) {
-            latestInviteSender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatool.home.invite.accepted_by", "Your teleport request was accepted by %s!", receiver.getName()));
+            latestInviteSender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatools.home.invite.accepted_by", "Your teleport request was accepted by %s!", receiver.getName()));
         }
 
         return 1;
@@ -1238,7 +1227,7 @@ public class HomeHandler {
     private static int denyInvite(CommandSourceStack source, ServerPlayer receiver, ServerPlayer sender) {
         List<InviteRequest> invites = pendingInvites.get(receiver.getUUID());
         if (invites == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_from_player", "No pending invites from that player."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_from_player", "No pending invites from that player."));
             return 0;
         }
 
@@ -1251,7 +1240,7 @@ public class HomeHandler {
         }
 
         if (foundInvite == null) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_from_player", "No pending invite from that player."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_from_player", "No pending invite from that player."));
             return 0;
         }
 
@@ -1263,8 +1252,10 @@ public class HomeHandler {
 
         final String homeNameFinal = foundInvite.homeName;
 
-        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.denied", "Invite from %s denied.", homeNameFinal), true);
-        sender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatool.tpa.denied_by", "%s denied your invite to %s.", receiver.getName(), homeNameFinal));
+        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.denied", "Invite from %s denied.",
+                sender.getName().getString()), true);
+        sender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatools.tpa.denied_by", "%s denied your invite to %s.",
+                receiver.getName(), homeNameFinal));
 
         return 1;
     }
@@ -1272,7 +1263,7 @@ public class HomeHandler {
     private static int denyLatestInvite(CommandSourceStack source, ServerPlayer receiver) {
         List<InviteRequest> invites = pendingInvites.get(receiver.getUUID());
         if (invites == null || invites.isEmpty()) {
-            source.sendFailure(ModUtils.translateWithFallback("command.tpatool.home.invite.no_invites", "No pending invites."));
+            source.sendFailure(ModUtils.translateWithFallback("command.tpatools.home.invite.no_invites", "No pending invites."));
             return 0;
         }
 
@@ -1291,11 +1282,13 @@ public class HomeHandler {
         }
 
         final String homeNameFinal = latestInvite.homeName;
+        final String senderNameFinal = latestInvite.senderName;
 
-        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatool.home.invite.denied", "Invite from %s denied.", homeNameFinal), true);
+        source.sendSuccess(() -> ModUtils.translateWithFallback("command.tpatools.home.invite.denied", "Invite from %s denied.",
+                senderNameFinal), true);
         ServerPlayer latestInviteSender = receiver.getServer().getPlayerList().getPlayer(latestInvite.senderUUID);
         if (latestInviteSender != null) {
-            latestInviteSender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatool.tpa.denied_by", "%s denied your invite to %s.", receiver.getName(), homeNameFinal));
+            latestInviteSender.sendSystemMessage(ModUtils.translateWithFallback("command.tpatools.tpa.denied_by", "%s denied your invite to %s.", receiver.getName(), homeNameFinal));
         }
 
         return 1;
@@ -1314,7 +1307,107 @@ public class HomeHandler {
             }
             ModUtils.teleportWithAllChains(player, targetLevel, tx, ty, tz, player.getYRot(), player.getXRot());
         } else {
-            player.sendSystemMessage(ModUtils.translateWithFallback("command.tpatool.home.invite.teleport_failed", "Failed to teleport: invalid dimension.").withStyle(ChatFormatting.RED));
+            player.sendSystemMessage(ModUtils.translateWithFallback("command.tpatools.home.invite.teleport_failed", "Failed to teleport: invalid dimension.").withStyle(ChatFormatting.RED));
+        }
+    }
+
+    /**
+     * /home tp 的前置校验：自己的家直接放行；"玩家名:家名" 形式则校验公开/分享权限。
+     */
+    private static boolean validateHomeAccessible(ServerPlayer player, String homeName) {
+        Map<String, Home> homes = playerHomes.get(player.getUUID());
+        if (homes != null && homes.containsKey(homeName)) {
+            Home home = homes.get(homeName);
+            ServerLevel targetLevel = player.getServer().getLevel(ResourceKey.create(
+                    Registries.DIMENSION, home.position.dimension));
+            if (targetLevel == null) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.invalid_dimension",
+                        "Invalid dimension for home %s!",
+                        homeName
+                ));
+                return false;
+            }
+            return true;
+        }
+        // 不是自己的家：支持用 玩家名:家名 访问公开或分享给自己的家
+        if (homeName.indexOf(':') >= 0) {
+            return validateOtherHomeExists(player, homeName);
+        }
+        player.sendSystemMessage(ModUtils.translateWithFallback(
+                "command.tpatools.home.not_found",
+                "Home %s not found!",
+                homeName
+        ));
+        return false;
+    }
+
+    /**
+     * /home otherhome 的前置校验：目标家必须存在，且是公开的或已分享给该玩家。
+     */
+    private static boolean validateOtherHomeExists(ServerPlayer player, String homeArg) {
+        try {
+            String[] parts = homeArg.split(":", 2);
+            if (parts.length != 2) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.invalid_format",
+                        "Invalid format! Use playername:homename."
+                ));
+                return false;
+            }
+            String ownerName = parts[0];
+            String homeName = parts[1];
+
+            Optional<GameProfile> profile = player.getServer().getProfileCache().get(ownerName);
+            if (profile.isEmpty()) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.other_not_found",
+                        "Home %s not found or not accessible!",
+                        homeArg
+                ));
+                return false;
+            }
+            UUID ownerUUID = profile.get().getId();
+
+            Map<String, PublicHomeInfo> ownerPublicHomes = publicHomesByOwner.get(ownerUUID.toString());
+            boolean isPublic = ownerPublicHomes != null && ownerPublicHomes.containsKey(homeName);
+
+            Map<String, Home> homes = playerHomes.get(ownerUUID);
+            if (homes == null || !homes.containsKey(homeName)) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.other_not_found",
+                        "Home %s not found or not accessible!",
+                        homeArg
+                ));
+                return false;
+            }
+            Home home = homes.get(homeName);
+            if (!isPublic && !home.sharedPlayers.contains(player.getUUID())) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.other_not_found",
+                        "Home %s not found or not accessible!",
+                        homeArg
+                ));
+                return false;
+            }
+            ServerLevel targetLevel = player.getServer().getLevel(ResourceKey.create(
+                    Registries.DIMENSION, home.position.dimension));
+            if (targetLevel == null) {
+                player.sendSystemMessage(ModUtils.translateWithFallback(
+                        "command.tpatools.home.invalid_dimension",
+                        "Invalid dimension for home %s!",
+                        homeArg
+                ));
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            LOGGER.error("Error validating other home {}: {}", homeArg, e.getMessage());
+            player.sendSystemMessage(ModUtils.translateWithFallback(
+                    "command.tpatools.error",
+                    "An unexpected error occurred while executing the command."
+            ));
+            return false;
         }
     }
 
