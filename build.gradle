@@ -120,6 +120,16 @@ repositories {
     // flatDir {
     //     dir 'libs'
     // }
+    // 1. 阿里云的 Forge 专用镜像（优先）
+    maven { url 'https://maven.aliyun.com/repository/forge' }
+    // 2. 阿里云公共仓库，覆盖大部分通用依赖
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    // 3. 腾讯云镜像作为补充（如果阿里云缺少某些版本）
+    maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    // 4. 最后保留官方源作为最终后备
+    maven { url 'https://maven.minecraftforge.net' }
+    mavenCentral()
+
 }
 
 dependencies {

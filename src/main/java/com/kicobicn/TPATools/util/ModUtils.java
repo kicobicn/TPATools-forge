@@ -1,8 +1,10 @@
 package com.kicobicn.TPATools.util;
 
 import com.google.common.reflect.TypeToken;
+import com.kicobicn.TPATools.Commands.BackHandler;
 import com.kicobicn.TPATools.Commands.GraveHandler;
 import com.kicobicn.TPATools.Commands.HomeHandler;
+import com.kicobicn.TPATools.Commands.RTPHandler;
 import com.kicobicn.TPATools.Commands.TPAHandler;
 import com.kicobicn.TPATools.Commands.WarpHandler;
 import com.kicobicn.TPATools.config.ModConfigs;
@@ -48,6 +50,8 @@ public class ModUtils {
         loadLockedPlayers();
         loadCommandPermissions();
         WarpHandler.loadWarpPoints();
+        BackHandler.loadBackPositions();
+        RTPHandler.loadCooldowns();
     }
 
     @SubscribeEvent
@@ -58,6 +62,8 @@ public class ModUtils {
         saveLockedPlayers();
         saveCommandPermissions();
         WarpHandler.saveWarpPoints();
+        BackHandler.saveBackPositions();
+        RTPHandler.saveCooldowns();
     }
 
     public static MutableComponent translateWithFallback(String key, String fallback, Object... args) {
@@ -70,7 +76,16 @@ public class ModUtils {
                 stringArgs[i] = args[i];
             }
         }
-        return Component.literal(String.format(translated, stringArgs));
+        String text;
+        try {
+            text = String.format(translated, stringArgs);
+        } catch (RuntimeException e) {
+            // 占位符与实参不匹配（例如译文含 %s 但调用方没传参）时退化为纯文本，
+            // 避免在服务器 tick 内抛 MissingFormatArgumentException 打断主循环。
+            LOGGER.warn("Bad format for translation key {}: {}", key, translated);
+            text = translated;
+        }
+        return Component.literal(text);
     }
 
     // 加载翻译
@@ -93,36 +108,36 @@ public class ModUtils {
         }
     }
 
-    private static final Set<String> availableLanguages = new HashSet<>(Set.of("en_us", "zh_cn", "fr_fr", "pt_br", "es_es", "zh_cn_cute"));
-
-    public static void detectAvailableLanguages() {
-        availableLanguages.clear();
-        try {
-            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-            if (server != null) {
-                var resources = server.getResourceManager().listResources("lang", path -> path.getPath().endsWith(".json"));
-                for (var entry : resources.entrySet()) {
-                    ResourceLocation loc = entry.getKey();
-                    String path = loc.getPath();
-                    if (path.startsWith("lang/") && path.endsWith(".json")) {
-                        String langCode = path.substring(5, path.length() - 5); // 去掉 "lang/" 和 ".json"
-                        availableLanguages.add(langCode);
-                    }
-                }
-                if (availableLanguages.isEmpty()) {
-                    ModConfigs.DebugLog.warn("No languages detected, fallback to en_us/zh_cn");
-                    availableLanguages.add("en_us");
-                    availableLanguages.add("zh_cn");
-                    availableLanguages.add("fr_fr");
-                    availableLanguages.add("pt_br");
-                    availableLanguages.add("es_es");
-                    availableLanguages.add("zh_cn_cute");
-                }
-                ModConfigs.DebugLog.info("Detected languages: {}", availableLanguages);
-            }
-        } catch (Exception e) {
-            LOGGER.error("Failed to detect languages: {}", e.getMessage());
+    /**
+     * 把 identifier 字符串（形如 {@code minecraft:overworld}）解析回 {@link ResourceLocation}。
+     * <p>存储层统一用 {@link ResourceLocation#toString()} 写入，读取时必须用本方法还原，
+     * 否则会得到 {@code minecraft:minecraft:overworld} 这类非法维度。</p>
+     */
+    public static ResourceLocation parseIdentifier(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return ResourceLocation.fromNamespaceAndPath("minecraft", "overworld");
         }
+        String value = raw.trim();
+        int split = value.indexOf(':');
+        String namespace = split < 0 ? "minecraft" : value.substring(0, split);
+        String path = split < 0 ? value : value.substring(split + 1);
+        if (namespace.isEmpty()) {
+            namespace = "minecraft";
+        }
+        if (path.isEmpty()) {
+            path = "overworld";
+        }
+        try {
+            return ResourceLocation.fromNamespaceAndPath(namespace, path);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Invalid dimension id '{}', falling back to overworld", raw);
+            return ResourceLocation.fromNamespaceAndPath("minecraft", "overworld");
+        }
+    }
+
+    /** 统一的 identifier 写库格式 */
+    public static String formatIdentifier(ResourceLocation identifier) {
+        return identifier == null ? "minecraft:overworld" : identifier.toString();
     }
 
     /**
@@ -260,6 +275,8 @@ public class ModUtils {
     }
 
     public static void tick() {
+        TeleportDelayManager.tick();
+
         List<UUID> toRemove = new ArrayList<>();
         for (Map.Entry<UUID, List<TPAHandler.TPARequest>> entry : requests.entrySet()) {
             Iterator<TPAHandler.TPARequest> iterator = entry.getValue().iterator();
@@ -267,11 +284,11 @@ public class ModUtils {
                 TPAHandler.TPARequest request = iterator.next();
                 if (System.currentTimeMillis() - request.timestamp >= TIMEOUT_TICKS.get() * 50) {
                     request.target.sendSystemMessage(translateWithFallback(
-                            request.isTPHere ? "command.tpatool.tpahere.timeout" : "command.tpatool.tpa.timeout",
+                            request.isTPHere ? "command.tpatools.tpahere.timeout" : "command.tpatools.tpa.timeout",
                             "Teleport request from %s has timed out.", request.sender.getName()
                     ));
                     request.sender.sendSystemMessage(translateWithFallback(
-                            "command.tpatool.tpa.timeout_self",
+                            "command.tpatools.tpa.timeout_self",
                             "Your teleport request to %s has timed out.", request.target.getName()
                     ));
                     iterator.remove();
